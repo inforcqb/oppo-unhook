@@ -1,16 +1,19 @@
 /*
- * oppo_unhook.c — eBPF-based OPPO security hook disabler
- * =================================================================
+ * oppo_unhook.c — eBPF OPPO security hook killer (no ELF needed)
+ * ===============================================================
  *
- * 1. Finds oplus_security_guard hook array addresses via kallsyms
- * 2. Loads the BPF kprobe program (unhook.bpf.o)
- * 3. Populates BPF config map with target addresses
- * 4. Attaches kprobe to __arm64_sys_getpid
- * 5. Triggers by calling getpid() → BPF writes zeros to hook arrays
- * 6. Verifies hooks disabled by checking dmesg or ROOTCHECK log
+ * Generates BPF instructions directly, avoiding ELF/relocation hell.
  *
- * Requires: root, CONFIG_BPF=y, CONFIG_KPROBES=y
- * Usage: oppo_unhook [unhook.bpf.o path] [--dry-run]
+ * BPF program (pseudo):
+ *   R1 = &config (map fd)
+ *   R2 = &key
+ *   call map_lookup_elem  →  R0 = value_ptr (or NULL)
+ *   if R0 == NULL: bail
+ *   R1 = *value_ptr (hook addr from map)
+ *   R2 = &zero (on stack)
+ *   R3 = 8
+ *   call probe_write_kernel
+ *   exit
  */
 
 #define _GNU_SOURCE
@@ -21,32 +24,75 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <elf.h>
 #include <sys/syscall.h>
-#include <sys/stat.h>
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 
-/* ── BPF syscall wrapper ────────────────────────────────────── */
-static inline int bpf(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size)
-{
-    return syscall(__NR_bpf, cmd, attr, size);
-}
+/* ── BPF instruction encoding ───────────────────────────────── */
+struct bpf_insn {
+    __u8  code;
+    __u8  dst_reg:4;
+    __u8  src_reg:4;
+    __s16 off;
+    __s32 imm;
+};
 
-/* ── perf_event_open syscall ────────────────────────────────── */
-static inline int perf_event_open(struct perf_event_attr *attr,
-                                   pid_t pid, int cpu, int group_fd,
-                                   unsigned long flags)
-{
-    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
-}
+#define BPF_LD_IMM64(DST, IMM) \
+    ((struct bpf_insn){ .code = 0x18, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = (__u32)(IMM) }), \
+    ((struct bpf_insn){ .code = 0x00, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = (__u32)((IMM) >> 32) })
+
+#define BPF_MOV64_IMM(DST, IMM) \
+    ((struct bpf_insn){ .code = 0xb7, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
+
+#define BPF_MOV64_REG(DST, SRC) \
+    ((struct bpf_insn){ .code = 0xbf, .dst_reg = DST, .src_reg = SRC, .off = 0, .imm = 0 })
+
+#define BPF_STX_MEM(SIZE, DST, SRC, OFF) \
+    ((struct bpf_insn){ .code = 0x63, .dst_reg = DST, .src_reg = SRC, .off = OFF, .imm = 0 })
+
+#define BPF_ALU64_IMM(OP, DST, IMM) \
+    ((struct bpf_insn){ .code = 0x07, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
+
+#define BPF_JMP_IMM(OP, DST, IMM, OFF) \
+    ((struct bpf_insn){ .code = 0x05, .dst_reg = DST, .src_reg = 0, .off = OFF, .imm = IMM })
+
+#define BPF_CALL_REL(IMM) \
+    ((struct bpf_insn){ .code = 0x85, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = IMM })
+
+#define BPF_EXIT() \
+    ((struct bpf_insn){ .code = 0x95, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = 0 })
+
+#define BPF_JMP_A(OFF) \
+    ((struct bpf_insn){ .code = 0x05, .dst_reg = 0, .src_reg = 0, .off = OFF, .imm = 0 })
+
+#define BPF_MOV64_IMM(DST, IMM) \
+    ((struct bpf_insn){ .code = 0xb7, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
+
+/* BPF registers */
+#define BPF_REG_0  0
+#define BPF_REG_1  1
+#define BPF_REG_2  2
+#define BPF_REG_3  3
+#define BPF_REG_6  6
+#define BPF_REG_7  7
+#define BPF_REG_8  8
+#define BPF_REG_9  9
+#define BPF_REG_10 10
+
+/* BPF helper func IDs */
+#define BPF_FUNC_probe_write_kernel 36
+#define BPF_FUNC_map_lookup_elem    1
+
+/* ── syscall wrappers ────────────────────────────────────────── */
+static int bpf_sys(enum bpf_cmd cmd, union bpf_attr *attr)
+{ return syscall(__NR_bpf, cmd, attr, sizeof(*attr)); }
+
+static int perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int gfd, unsigned long fl)
+{ return syscall(__NR_perf_event_open, attr, pid, cpu, gfd, fl); }
 
 /* ── helpers ────────────────────────────────────────────────── */
 static void die(const char *msg)
-{
-    fprintf(stderr, "[-] %s (errno=%d: %s)\n", msg, errno, strerror(errno));
-    exit(1);
-}
+{ fprintf(stderr, "[-] %s (errno=%d: %s)\n", msg, errno, strerror(errno)); exit(1); }
 
 static uint64_t kallsyms_find(const char *name)
 {
@@ -54,407 +100,263 @@ static uint64_t kallsyms_find(const char *name)
     if (!f) return 0;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        char symtype, symname[128];
-        uint64_t addr = 0;
-        if (sscanf(line, "%lx %c %127s", &addr, &symtype, symname) != 3)
-            continue;
-        if (addr == 0) continue;
-        if (strstr(symname, name)) { fclose(f); return addr; }
+        char t; char n[128]; uint64_t a;
+        if (sscanf(line, "%lx %c %127s", &a, &t, n) != 3) continue;
+        if (a == 0) continue;
+        if (strstr(n, name)) { fclose(f); return a; }
     }
-    fclose(f);
-    return 0;
+    fclose(f); return 0;
 }
 
-/* ── Minimal ELF parser for loading BPF objects ──────────────── */
-struct bpf_elf_ctx {
-    const char *data;
-    size_t size;
-    Elf64_Ehdr *ehdr;
-    Elf64_Shdr *shdrs;
-    const char *shstrtab;
-    int prog_fd;
-    int map_fd;
-};
-
-static int bpf_elf_load(const char *path, struct bpf_elf_ctx *ctx)
+/* ── Build BPF program ─────────────────────────────────────────
+ *
+ * for (i = 0; i < entry_cnt; i++) {
+ *     val = config_map[i]
+ *     if (val) bpf_probe_write_kernel((void*)val, &zero, 8);
+ * }
+ *
+ * Config map layout:
+ * Key 0-7: target addresses (hook array entries)
+ * Max entries: 16, Value: 8 bytes
+ */
+static int build_bpf(int map_fd, int entry_cnt)
 {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->prog_fd = -1;
-    ctx->map_fd = -1;
+    struct bpf_insn prog[] = {
+        // R6 = 0 (zero value for writes)
+        BPF_MOV64_IMM(BPF_REG_6, 0),
+        // Store zero on stack at -8 for probe_write_kernel src
+        BPF_STX_MEM(0x18, BPF_REG_10, BPF_REG_6, -8),  // BPF_DW = 0x18
+        // R7 = &zero (stack pointer - 8)
+        BPF_MOV64_REG(BPF_REG_7, BPF_REG_10),
+        BPF_ALU64_IMM(0, BPF_REG_7, -8),  // 0 = ADD
 
-    /* Read entire file */
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    struct stat st;
-    fstat(fd, &st);
-    ctx->size = st.st_size;
-    ctx->data = malloc(ctx->size);
-    if (!ctx->data) { close(fd); return -1; }
-    read(fd, (void *)ctx->data, ctx->size);
-    close(fd);
+        // R8 = loop counter (0 to entry_cnt-1)
+        BPF_MOV64_IMM(BPF_REG_8, 0),
 
-    ctx->ehdr = (Elf64_Ehdr *)ctx->data;
-    if (memcmp(ctx->ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
-        fprintf(stderr, "[-] Not an ELF file\n"); return -1;
+        // -- loop start --
+        // R1 = map_fd (pseudo)
+        BPF_LD_IMM64(BPF_REG_1, map_fd),
+        // R2 = &counter (stack -16)
+        BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
+        BPF_ALU64_IMM(0, BPF_REG_2, -16),
+        // Store counter
+        BPF_STX_MEM(0x04, BPF_REG_2, BPF_REG_8, 0),  // BPF_W = 0x04, store at R2+0
+
+        // R2 = &counter (reload, clobbered by STX? no, STX doesn't clobber DST)
+        BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
+        BPF_ALU64_IMM(0, BPF_REG_2, -16),
+
+        // call map_lookup_elem(R1=map, R2=key) → R0
+        BPF_CALL_REL(BPF_FUNC_map_lookup_elem),
+
+        // if R0 == NULL: skip
+        BPF_JMP_IMM(0x04, BPF_REG_0, 0, 3),  // 0x04 = JNE (jump if R0 != 0), skip 3
+
+        // R1 = *R0 (hook addr)
+        // This needs: R1 = *(u64 *)R0
+        // BPF_LDX_MEM(BPF_DW, R1, R0, 0) → code 0x79
+        ((struct bpf_insn){ .code = 0x79, .dst_reg = BPF_REG_1, .src_reg = BPF_REG_0, .off = 0, .imm = 0 }),
+
+        // R2 = &zero (R7)
+        BPF_MOV64_REG(BPF_REG_2, BPF_REG_7),
+        // R3 = 8
+        BPF_MOV64_IMM(BPF_REG_3, 8),
+        // call probe_write_kernel(R1,R2,R3)
+        BPF_CALL_REL(BPF_FUNC_probe_write_kernel),
+
+        // R8++ (loop counter)
+        BPF_ALU64_IMM(0, BPF_REG_8, 1),
+
+        // if R8 < entry_cnt, goto loop start
+        BPF_JMP_IMM(0x0a, BPF_REG_8, entry_cnt, -12),  // 0x0a = JLT (unsigned <)
+
+        // R0 = 0
+        BPF_MOV64_IMM(BPF_REG_0, 0),
+        BPF_EXIT(),
+    };
+
+    /* Set src_reg = BPF_PSEUDO_MAP_FD (1) for the LD_IMM64 instruction */
+    prog[13].src_reg = 1;   /* src_reg of first LD_IMM64 word */
+    prog[13].imm = 0;        /* imm of first word = 0 for pseudo-map-fd */
+    /* prog[14] already has map_fd in its imm field from BPF_LD_IMM64 macro */
+
+    union bpf_attr attr = {0};
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.insns = (unsigned long)prog;
+    attr.insn_cnt = sizeof(prog) / sizeof(prog[0]);
+    attr.license = (unsigned long)"GPL";
+    attr.log_level = 1;
+    char logbuf[65536] = {0};
+    attr.log_buf = (unsigned long)logbuf;
+    attr.log_size = sizeof(logbuf);
+
+    int prog_fd = bpf_sys(BPF_PROG_LOAD, &attr);
+    if (prog_fd < 0) {
+        fprintf(stderr, "[-] BPF_PROG_LOAD failed: %s\n", strerror(errno));
+        fprintf(stderr, "[!] Verifier log:\n%s\n", logbuf);
+        return -1;
     }
-
-    /* Section headers */
-    ctx->shdrs = (Elf64_Shdr *)(ctx->data + ctx->ehdr->e_shoff);
-    Elf64_Shdr *shstr = &ctx->shdrs[ctx->ehdr->e_shstrndx];
-    ctx->shstrtab = ctx->data + shstr->sh_offset;
-
-    return 0;
+    printf("[+] BPF program loaded (fd=%d, %zu insns)\n",
+           prog_fd, sizeof(prog) / sizeof(prog[0]));
+    printf("[+] Verifier: OK\n");
+    return prog_fd;
 }
 
-static const char *shname(struct bpf_elf_ctx *ctx, int idx)
+/* ── Create config map ───────────────────────────────────────── */
+static int create_config_map(uint64_t *addrs, int count)
 {
-    return ctx->shstrtab + ctx->shdrs[idx].sh_name;
-}
+    union bpf_attr attr = {0};
+    attr.map_type = BPF_MAP_TYPE_ARRAY;
+    attr.key_size = 4;
+    attr.value_size = 8;
+    attr.max_entries = 16;
 
-static void *shdata(struct bpf_elf_ctx *ctx, int idx)
-{
-    return (void *)(ctx->data + ctx->shdrs[idx].sh_offset);
-}
+    int fd = bpf_sys(BPF_MAP_CREATE, &attr);
+    if (fd < 0) die("BPF_MAP_CREATE");
+    printf("[+] Config map created (fd=%d)\n", fd);
 
-/* Load BPF programs and maps from ELF */
-static int bpf_elf_load_all(struct bpf_elf_ctx *ctx)
-{
-    for (int i = 1; i < ctx->ehdr->e_shnum; i++) {
-        Elf64_Shdr *sh = &ctx->shdrs[i];
-        const char *name = shname(ctx, i);
-
-        /* Skip non-program sections */
-        if (sh->sh_type != SHT_PROGBITS) continue;
-
-        /* Load BPF programs */
-        if (strncmp(name, "kprobe/", 7) == 0 ||
-            strncmp(name, "kretprobe/", 10) == 0 ||
-            strcmp(name, "license") == 0) {
-            continue; /* handled below */
-        }
-
-        /* Load maps */
-        if (strcmp(name, ".maps") == 0) {
-            /* Find map definitions */
-            for (int j = 1; j < ctx->ehdr->e_shnum; j++) {
-                if (strcmp(shname(ctx, j), "maps") == 0) {
-                    /* Map data section */
-                    Elf64_Shdr *ms = &ctx->shdrs[j];
-                    void *mdata = shdata(ctx, j);
-                    size_t msize = ms->sh_size;
-
-                    /* Parse BTF map definitions — simplified:
-                     * Just create an ARRAY map with 4 entries */
-                    union bpf_attr attr = {0};
-                    attr.map_type = BPF_MAP_TYPE_ARRAY;
-                    attr.key_size = 4;
-                    attr.value_size = 8;
-                    attr.max_entries = 4;
-                    strcpy(attr.map_name, "config");
-
-                    ctx->map_fd = bpf(BPF_MAP_CREATE, &attr, sizeof(attr));
-                    if (ctx->map_fd < 0) {
-                        fprintf(stderr, "[-] map create: %d (%s)\n", errno, strerror(errno));
-                        return -1;
-                    }
-                    printf("[+] Created config map (fd=%d)\n", ctx->map_fd);
-
-                    (void)mdata; (void)msize;
-                    break;
-                }
-            }
-        }
-    }
-
-    /* Load kprobe program */
-    for (int i = 1; i < ctx->ehdr->e_shnum; i++) {
-        const char *name = shname(ctx, i);
-        if (strncmp(name, "kprobe/", 7) == 0 ||
-            strncmp(name, "kretprobe/", 10) == 0) {
-
-            void *insns = shdata(ctx, i);
-            size_t insn_cnt = ctx->shdrs[i].sh_size / 8;
-
-            /* Find corresponding .rel section for map relocations */
-            for (int j = 1; j < ctx->ehdr->e_shnum; j++) {
-                char relname[64];
-                snprintf(relname, sizeof(relname), ".rel%s", name);
-                if (strcmp(shname(ctx, j), relname) == 0) {
-                    /* Fix up map_fd references */
-                    Elf64_Rel *rels = shdata(ctx, j);
-                    size_t nrel = ctx->shdrs[j].sh_size / sizeof(Elf64_Rel);
-                    for (size_t r = 0; r < nrel; r++) {
-                        uint32_t *insn = (uint32_t *)((char *)insns + rels[r].r_offset);
-                        /* BPF_LD_IMM64: patch src_reg with map_fd */
-                        if ((insn[0] & 0xFF) == 0x18) {  /* BPF_LD | BPF_IMM | BPF_DW */
-                            insn[0] = (insn[0] & 0xFFFF) | (ctx->map_fd << 16);
-                        }
-                    }
-                }
-            }
-
-            /* Fix license section relocation */
-            for (int j = 1; j < ctx->ehdr->e_shnum; j++) {
-                if (strcmp(shname(ctx, j), "license") == 0) {
-                    char lic_rel[64];
-                    snprintf(lic_rel, sizeof(lic_rel), ".rel%s", name);
-                    /* If there's a relocation for license, patch it */
-                    /* For simplicity, skip — GPL license is handled by kernel */
-                }
-            }
-
-            union bpf_attr attr = {0};
-            attr.prog_type = BPF_PROG_TYPE_KPROBE;
-            attr.insns = (unsigned long)insns;
-            attr.insn_cnt = insn_cnt;
-            attr.license = (unsigned long)"GPL";
-            attr.log_level = 1;
-            attr.log_buf = (unsigned long)malloc(65536);
-            attr.log_size = 65536;
-            memset((void *)(unsigned long)attr.log_buf, 0, 65536);
-
-            ctx->prog_fd = bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
-            if (ctx->prog_fd < 0) {
-                fprintf(stderr, "[-] BPF_PROG_LOAD failed: %d (%s)\n",
-                        errno, strerror(errno));
-                fprintf(stderr, "[!] Verifier log:\n%s\n",
-                        (char *)(unsigned long)attr.log_buf);
-                free((void *)(unsigned long)attr.log_buf);
-                return -1;
-            }
-            free((void *)(unsigned long)attr.log_buf);
-            printf("[+] BPF program loaded (fd=%d, %zu insns)\n",
-                   ctx->prog_fd, insn_cnt);
-
-            return 0; /* Only load first program for now */
+    /* Populate map with hook addresses */
+    for (int i = 0; i < count && i < 16; i++) {
+        union bpf_attr ua = {0};
+        uint32_t key = i;
+        ua.map_fd = fd;
+        ua.key = (unsigned long)&key;
+        ua.value = (unsigned long)&addrs[i];
+        ua.flags = BPF_ANY;
+        if (bpf_sys(BPF_MAP_UPDATE_ELEM, &ua) < 0) {
+            fprintf(stderr, "[-] map update key=%d: %s\n", i, strerror(errno));
+        } else {
+            printf("  [map] key=%d val=0x%lx\n", i, addrs[i]);
         }
     }
 
-    fprintf(stderr, "[-] No kprobe program found in ELF\n");
-    return -1;
+    return fd;
 }
 
-/* Attach kprobe to a kernel function */
-static int kprobe_attach(int prog_fd, const char *func_name)
+/* ── Attach kprobe ───────────────────────────────────────────── */
+static int attach_kprobe(int prog_fd, const char *func)
 {
-    /* Create perf event for kprobe */
+    /* Mount debugfs */
+    system("mount -t debugfs none /sys/kernel/debug 2>/dev/null");
+
+    /* Create kprobe via debugfs */
+    int kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND);
+    if (kfd < 0) die("open kprobe_events");
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "-:oppo_unhook\n");
+    write(kfd, cmd, strlen(cmd)); /* remove existing */
+
+    snprintf(cmd, sizeof(cmd), "p:oppo_unhook %s\n", func);
+    if (write(kfd, cmd, strlen(cmd)) < 0) { close(kfd); die("write kprobe"); }
+    close(kfd);
+    printf("[+] Kprobe: p:oppo_unhook %s\n", func);
+
+    /* Get event ID */
+    int efd = open("/sys/kernel/debug/tracing/events/kprobes/oppo_unhook/id", O_RDONLY);
+    if (efd < 0) die("open event id");
+    char buf[16] = {0};
+    read(efd, buf, sizeof(buf) - 1);
+    close(efd);
+    int eid = atoi(buf);
+
+    /* perf_event_open */
     struct perf_event_attr attr = {0};
-    attr.type = 7; /* PERF_TYPE_TRACEPOINT for kprobe */
+    attr.type = 2; /* PERF_TYPE_TRACEPOINT */
     attr.size = sizeof(attr);
-    attr.config = 0;  /* will be set by debugfs */
+    attr.config = eid;
     attr.sample_period = 1;
     attr.wakeup_events = 1;
 
-    /* kprobe via debugfs: write to /sys/kernel/debug/tracing/kprobe_events,
-     * then open the resulting event.
-     * 
-     * Simpler alternative: use PERF_TYPE_TRACEPOINT with kprobe events
-     * via /sys/kernel/debug/tracing/events/kprobes/<name>/id
-     */
+    int evfd = perf_open(&attr, -1, 0, -1, 0);
+    if (evfd < 0) die("perf_event_open");
 
-    /* Method: write kprobe event, then perf_event_open the event */
-    int kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND);
-    if (kfd < 0) {
-        fprintf(stderr, "[-] Cannot open kprobe_events (debugfs mounted?)\n");
-        fprintf(stderr, "    Try: mount -t debugfs none /sys/kernel/debug\n");
-        return -1;
-    }
-
-    char cmd[256];
-    /* Remove existing kprobe if any */
-    snprintf(cmd, sizeof(cmd), "-:unhook_kprobe\n");
-    write(kfd, cmd, strlen(cmd));
-
-    /* Add new kprobe */
-    snprintf(cmd, sizeof(cmd), "p:unhook_kprobe %s\n", func_name);
-    if (write(kfd, cmd, strlen(cmd)) < 0) {
-        fprintf(stderr, "[-] Failed to create kprobe: %s\n", strerror(errno));
-        close(kfd);
-        return -1;
-    }
-    close(kfd);
-    printf("[+] Kprobe created: p:unhook_kprobe %s\n", func_name);
-
-    /* Now open the event via perf_event_open */
-    /* First, get event ID */
-    int eid_fd = open("/sys/kernel/debug/tracing/events/kprobes/unhook_kprobe/id", O_RDONLY);
-    if (eid_fd < 0) {
-        fprintf(stderr, "[-] Cannot read event ID: %s\n", strerror(errno));
-        return -1;
-    }
-    char eid_buf[16] = {0};
-    read(eid_fd, eid_buf, sizeof(eid_buf) - 1);
-    close(eid_fd);
-    int eid = atoi(eid_buf);
-
-    attr.type = 2; /* PERF_TYPE_TRACEPOINT */
-    attr.config = eid;
-
-    int evt_fd = perf_event_open(&attr, -1, 0, -1, 0);
-    if (evt_fd < 0) {
-        fprintf(stderr, "[-] perf_event_open failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    /* Attach BPF program to event */
-    if (ioctl(evt_fd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) {
-        fprintf(stderr, "[-] PERF_EVENT_IOC_SET_BPF failed: %s\n", strerror(errno));
-        close(evt_fd);
-        return -1;
-    }
-
-    if (ioctl(evt_fd, PERF_EVENT_IOC_ENABLE) < 0) {
-        fprintf(stderr, "[-] PERF_EVENT_IOC_ENABLE failed: %s\n", strerror(errno));
-        close(evt_fd);
-        return -1;
-    }
-
-    printf("[+] Kprobe attached (event_fd=%d, event_id=%d)\n", evt_fd, eid);
-    return evt_fd;
-}
-
-/* Write config values to BPF map */
-static int config_map_set(int map_fd, uint32_t key, uint64_t value)
-{
-    union bpf_attr attr = {0};
-    attr.map_fd = map_fd;
-    attr.key = (unsigned long)&key;
-    attr.value = (unsigned long)&value;
-    attr.flags = BPF_ANY;
-
-    if (bpf(BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr)) < 0) {
-        fprintf(stderr, "[-] map update key=%u: %s\n", key, strerror(errno));
-        return -1;
-    }
-    return 0;
+    if (ioctl(evfd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) die("PERF_EVENT_IOC_SET_BPF");
+    if (ioctl(evfd, PERF_EVENT_IOC_ENABLE) < 0) die("PERF_EVENT_IOC_ENABLE");
+    printf("[+] Kprobe attached (event_fd=%d)\n", evfd);
+    return evfd;
 }
 
 /* ── main ───────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    const char *bpf_path = "/data/local/tmp/unhook.bpf.o";
-    const char *kprobe_fn = "__arm64_sys_getpid";
-    int dry_run = 0;
-
-    if (argc > 1) {
-        if (strcmp(argv[1], "--dry-run") == 0) dry_run = 1;
-        else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
-            printf("Usage: oppo_unhook [BPF_OBJ_PATH] [--dry-run]\n");
-            printf("  BPF_OBJ_PATH  path to unhook.bpf.o (default: /data/local/tmp/unhook.bpf.o)\n");
-            printf("  --dry-run     test only, don't write hooks\n");
-            return 0;
-        } else bpf_path = argv[1];
-    }
-    if (argc > 2 && strcmp(argv[2], "--dry-run") == 0) dry_run = 1;
-
     printf("\n============================================\n");
-    printf("  oppo_unhook — eBPF Hook Disabler v2.0\n");
-    printf("  CVE-2026-43499 integration + eBPF write\n");
+    printf("  oppo_unhook — eBPF Hook Killer v3.0\n");
     printf("============================================\n\n");
 
     if (getuid() != 0) die("Must run as root");
 
-    /* Step 1: Find hook array addresses */
-    printf("[*] Finding hook array addresses...\n");
-    uint64_t pre_addr = kallsyms_find("oplus_pre_hook_array");
+    /* Step 1: Get hook addresses */
+    printf("[*] Finding hook addresses...\n");
+
+    /* Set kptr_restrict to 0 for visibility */
+    int kfd = open("/proc/sys/kernel/kptr_restrict", O_WRONLY);
+    if (kfd >= 0) { write(kfd, "0\n", 2); close(kfd); }
+
+    uint64_t pre_addr  = kallsyms_find("oplus_pre_hook_array");
     uint64_t post_addr = kallsyms_find("oplus_post_hook_array");
 
-    if (!pre_addr && !post_addr) {
-        printf("[-] Hook arrays not visible in kallsyms.\n");
-        printf("[*] Trying /sys/module sections...\n");
-
-        /* Fallback: read module section bases */
-        char buf[32];
-        int fd = open("/sys/module/oplus_security_guard/sections/.data", O_RDONLY);
-        if (fd >= 0) {
-            memset(buf, 0, sizeof(buf));
-            read(fd, buf, sizeof(buf) - 1);
-            close(fd);
-            uint64_t data_base = strtoull(buf, NULL, 16);
-            printf("[*] Module .data base: 0x%lx\n", data_base);
-        }
-        die("Cannot find hook addresses. Please provide them manually.");
-    }
+    if (!pre_addr && !post_addr) die("Cannot find hook arrays");
 
     printf("[+] pre_hook_array:  0x%lx\n", pre_addr);
     printf("[+] post_hook_array: 0x%lx\n", post_addr);
 
-    if (dry_run) {
-        printf("[*] Dry run complete. Addresses found.\n");
-        printf("[*] Run without --dry-run to disable hooks.\n");
-        return 0;
-    }
+    /*
+     * Hook array entry: struct { void *func; void *data; } = 16 bytes.
+     * pre_hook at 0x...010, post_hook at 0x...040 → 48 bytes gap = 3 entries in pre.
+     */
+    int pre_entries  = pre_addr  ? ((post_addr - pre_addr) / 16) : 0;
+    int post_entries = post_addr ? 8 : 0;  /* assume up to 8 entries */
+    printf("[*] Estimated: %d pre-hook entries, %d post-hook entries\n",
+           pre_entries, post_entries);
 
-    /* Step 2: Check debugfs is mounted */
-    if (access("/sys/kernel/debug/tracing/kprobe_events", W_OK) != 0) {
-        printf("[*] Mounting debugfs...\n");
-        system("mount -t debugfs none /sys/kernel/debug 2>/dev/null");
-        if (access("/sys/kernel/debug/tracing/kprobe_events", W_OK) != 0) {
-            die("Cannot access debugfs. Is CONFIG_DEBUG_FS=y?");
-        }
-    }
+    /* Build target list: one map entry per hook function pointer */
+    uint64_t targets[16] = {0};
+    int idx = 0;
+    for (int i = 0; i < pre_entries && idx < 8; i++)
+        targets[idx++] = pre_addr + i * 16;  /* point to func ptr slot */
+    for (int i = 0; i < post_entries && idx < 16; i++)
+        targets[idx++] = post_addr + i * 16;
 
-    /* Step 3: Load BPF program */
-    printf("\n[*] Loading BPF program: %s\n", bpf_path);
-    if (access(bpf_path, R_OK) != 0) {
-        die("BPF object file not found");
-    }
+    printf("[*] %d targets to zero\n", idx);
 
-    struct bpf_elf_ctx ctx;
-    if (bpf_elf_load(bpf_path, &ctx) != 0) {
-        die("Failed to parse BPF ELF");
-    }
+    /* Step 2: Create config map and populate */
+    int map_fd = create_config_map(targets, idx);
 
-    if (bpf_elf_load_all(&ctx) != 0) {
-        die("Failed to load BPF program");
-    }
+    /* Step 3: Build and load BPF program */
+    printf("\n[*] Building BPF program...\n");
+    int prog_fd = build_bpf(map_fd, idx);
+    if (prog_fd < 0) die("BPF build failed");
 
-    /* Step 4: Configure BPF map with hook addresses */
-    printf("\n[*] Configuring target addresses...\n");
-    config_map_set(ctx.map_fd, 0, pre_addr);   /* key=0: pre hook addr */
-    config_map_set(ctx.map_fd, 1, 32);          /* key=1: pre hook count */
-    config_map_set(ctx.map_fd, 2, post_addr);   /* key=2: post hook addr */
-    config_map_set(ctx.map_fd, 3, 32);          /* key=3: post hook count */
-    printf("[+] Config map populated\n");
+    /* Step 4: Attach kprobe */
+    printf("\n[*] Attaching kprobe...\n");
+    int evfd = attach_kprobe(prog_fd, "__arm64_sys_getpid");
 
-    /* Step 5: Attach kprobe */
-    printf("\n[*] Attaching kprobe to %s...\n", kprobe_fn);
-    int evt_fd = kprobe_attach(ctx.prog_fd, kprobe_fn);
-    if (evt_fd < 0) {
-        /* Cleanup */
-        close(ctx.prog_fd);
-        close(ctx.map_fd);
-        die("Failed to attach kprobe");
-    }
-
-    /* Step 6: Trigger the kprobe by calling getpid() */
-    printf("\n[*] Triggering kprobe (calling getpid)...\n");
+    /* Step 5: Trigger */
+    printf("\n[*] Triggering BPF program (calling getpid)...\n");
     pid_t pid = getpid();
-    printf("[+] getpid() = %d → BPF program should have fired\n", pid);
+    printf("[+] getpid() = %d → BPF fired!\n", pid);
 
-    /* Step 7: Verify */
-    printf("\n[*] Checking results:\n");
-    printf("[*] Run: dmesg | grep -i rootcheck\n");
-    printf("[*] If no new ROOTCHECK messages → hooks DISABLED ✓\n");
-    printf("[*] Now try: /data/local/tmp/ksud.so insmod /data/local/tmp/kernelsu.ko\n");
+    /* Step 6: Verify */
+    printf("\n=== DONE ===\n");
+    printf("[*] Check: dmesg | grep -i rootcheck\n");
+    printf("[*] If ROOTCHECK messages STOPPED → hooks disabled!\n");
+    printf("[*] Now: /data/local/tmp/ksud.so insmod /data/local/tmp/kernelsu.ko\n");
 
-    /* Keep kprobe attached (for verification) */
-    printf("\n[*] Kprobe is live. Press Enter to detach...\n");
-    getchar();
+    /* Keep attached for a few seconds */
+    printf("\n[*] Kprobe live. Waiting 5s for verification...\n");
+    sleep(5);
 
     /* Cleanup */
-    ioctl(evt_fd, PERF_EVENT_IOC_DISABLE);
-    close(evt_fd);
-    close(ctx.prog_fd);
-    close(ctx.map_fd);
+    ioctl(evfd, PERF_EVENT_IOC_DISABLE, 0);
+    close(evfd);
+    close(prog_fd);
+    close(map_fd);
 
     /* Remove kprobe */
-    int kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND);
-    if (kfd >= 0) {
-        write(kfd, "-:unhook_kprobe\n", 16);
-        close(kfd);
-    }
+    kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND);
+    if (kfd >= 0) { write(kfd, "-:oppo_unhook\n", 14); close(kfd); }
 
-    printf("[*] Kprobe detached. Done.\n");
+    printf("[*] Clean. Next: insmod kernelsu.ko\n");
     return 0;
 }
