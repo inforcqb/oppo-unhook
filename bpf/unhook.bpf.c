@@ -29,32 +29,39 @@ int unhook_kprobe(struct pt_regs *ctx)
 {
     unsigned long zero = 0;
     __u32 key;
+    unsigned long *pre_addr, *pre_cnt;
+    unsigned long *post_addr, *post_cnt;
+    unsigned long i;
+    unsigned long count;
+    long ret;
 
     /* Read pre_hook config: key=0 → addr, key=1 → count */
     key = 0;
-    unsigned long *pre_addr = bpf_map_lookup_elem(&config, &key);
+    pre_addr = bpf_map_lookup_elem(&config, &key);
     key = 1;
-    unsigned long *pre_cnt  = bpf_map_lookup_elem(&config, &key);
+    pre_cnt  = bpf_map_lookup_elem(&config, &key);
 
     /* Read post_hook config: key=2 → addr, key=3 → count */
     key = 2;
-    unsigned long *post_addr = bpf_map_lookup_elem(&config, &key);
+    post_addr = bpf_map_lookup_elem(&config, &key);
     key = 3;
-    unsigned long *post_cnt  = bpf_map_lookup_elem(&config, &key);
+    post_cnt  = bpf_map_lookup_elem(&config, &key);
 
     /* Zero pre_hook_array */
     if (pre_addr && pre_cnt && *pre_addr) {
-        unsigned long count = *pre_cnt > 64 ? 64 : *pre_cnt;
-        for (unsigned long i = 0; i < count; i++) {
-            probe_write_kernel((void *)(*pre_addr + i * 16), &zero, 8);
+        count = *pre_cnt > 64 ? 64 : *pre_cnt;
+        for (i = 0; i < count; i++) {
+            ret = probe_write_kernel((void *)(*pre_addr + i * 16), &zero, 8);
+            if (ret != 0) break;
         }
     }
 
     /* Zero post_hook_array */
     if (post_addr && post_cnt && *post_addr) {
-        unsigned long count = *post_cnt > 64 ? 64 : *post_cnt;
-        for (unsigned long i = 0; i < count; i++) {
-            probe_write_kernel((void *)(*post_addr + i * 16), &zero, 8);
+        count = *post_cnt > 64 ? 64 : *post_cnt;
+        for (i = 0; i < count; i++) {
+            ret = probe_write_kernel((void *)(*post_addr + i * 16), &zero, 8);
+            if (ret != 0) break;
         }
     }
 
