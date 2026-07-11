@@ -28,14 +28,9 @@
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 
-/* ── BPF instruction encoding ───────────────────────────────── */
-struct bpf_insn {
-    __u8  code;
-    __u8  dst_reg:4;
-    __u8  src_reg:4;
-    __s16 off;
-    __s32 imm;
-};
+/* ── BPF instruction encoding helpers ──────────────────────────
+ * Uses kernel's struct bpf_insn from <linux/bpf.h>
+ */
 
 #define BPF_LD_IMM64(DST, IMM) \
     ((struct bpf_insn){ .code = 0x18, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = (__u32)(IMM) }), \
