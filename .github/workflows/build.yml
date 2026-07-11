@@ -1,55 +1,72 @@
-name: Build oppo_unhook
+name: Build oppo-unhook
 
 on:
   push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      abi:
+        description: 'Target ABI'
+        required: true
+        default: 'arm64-v8a'
+        type: choice
+        options:
+          - arm64-v8a
+      platform:
+        description: 'Android API level (ex: android-35)'
+        required: true
+        default: 'android-35'
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - abi: arm64-v8a
-            api: 26
-
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Android NDK
+      - name: Select NDK version for target API level
+        id: select-ndk
+        shell: bash
         run: |
-          NDK_VER="27.0.12077973"
-          NDK_ZIP="android-ndk-r27-linux.zip"
-          curl -sL "https://dl.google.com/android/repository/${NDK_ZIP}" -o ndk.zip
+          PLATFORM="${{ github.event.inputs.platform || 'android-35' }}"
+          API_LEVEL="${PLATFORM#android-}"
+          echo "Target API level: $API_LEVEL"
+
+          if [ "$API_LEVEL" -le 35 ]; then
+            NDK_URL="https://dl.google.com/android/repository/android-ndk-r29-linux.zip"
+            NDK_DIR="android-ndk-r29"
+          else
+            echo "::error::API level $API_LEVEL is not yet supported by any available NDK."
+            echo "Check https://developer.android.com/ndk/downloads for latest NDK."
+            exit 1
+          fi
+
+          echo "Selected: $NDK_DIR (supports API <= $API_LEVEL)"
+          echo "NDK_URL=$NDK_URL" >> "$GITHUB_ENV"
+          echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
+
+      - name: Download and extract NDK
+        run: |
+          echo "Downloading $NDK_URL ..."
+          wget -q "$NDK_URL" -O ndk.zip
           unzip -q ndk.zip
-          mv android-ndk-r27 ndk
-          echo "ANDROID_NDK_HOME=${PWD}/ndk" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$PWD/$NDK_DIR" >> "$GITHUB_ENV"
 
-      - name: Setup CMake & Ninja
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
 
-      - name: Configure
+      - name: Build with CMake
         run: |
           cmake -B build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI="arm64-v8a" \
-            -DANDROID_PLATFORM="android-26" \
-            -DANDROID_STL="none"
-
-      - name: Build
-        run: cmake --build build
-
-      - name: Show binary info
-        run: |
-          file build/oppo_unhook
-          ls -lh build/oppo_unhook
+                -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK_HOME }}/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=${{ github.event.inputs.abi || 'arm64-v8a' }} \
+                -DANDROID_PLATFORM=${{ github.event.inputs.platform || 'android-35' }}
+          cmake --build build
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: oppo_unhook-arm64
-          path: build/oppo_unhook
+          name: oppo-unhook-${{ github.event.inputs.abi || 'arm64-v8a' }}
+          path: |
+            build/oppo_unhook
+            build/oracle_test
