@@ -129,8 +129,9 @@ static int build_bpf(int map_fd, int entry_cnt)
         BPF_MOV64_IMM(BPF_REG_8, 0),
 
         // -- loop start --
-        // R1 = map_fd (pseudo)
-        BPF_LD_IMM64(BPF_REG_1, map_fd),
+        // R1 = map_fd (pseudo-map-fd)
+        ((struct bpf_insn){ .code = 0x18, .dst_reg = BPF_REG_1, .src_reg = 1, .off = 0, .imm = 0 }),
+        ((struct bpf_insn){ .code = 0x00, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = map_fd }),
         // R2 = &counter (stack -16)
         BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
         BPF_ALU64_IMM(0, BPF_REG_2, -16),
@@ -169,11 +170,6 @@ static int build_bpf(int map_fd, int entry_cnt)
         BPF_MOV64_IMM(BPF_REG_0, 0),
         BPF_EXIT(),
     };
-
-    /* Set src_reg = BPF_PSEUDO_MAP_FD (1) for the LD_IMM64 instruction */
-    prog[13].src_reg = 1;   /* src_reg of first LD_IMM64 word */
-    prog[13].imm = 0;        /* imm of first word = 0 for pseudo-map-fd */
-    /* prog[14] already has map_fd in its imm field from BPF_LD_IMM64 macro */
 
     union bpf_attr attr = {0};
     attr.prog_type = BPF_PROG_TYPE_KPROBE;
