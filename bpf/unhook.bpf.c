@@ -1,67 +1,97 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * unhook.bpf.c — eBPF kprobe: zero out oplus_security_guard hooks
- *
- * Attach: kprobe on __arm64_sys_getpid
- * Action: write 0 to pre/post hook arrays via bpf_probe_write_kernel
+ * unhook.bpf.c — eBPF kprobe: zero oplus_security_guard hook arrays
  *
  * Build: clang -target bpf -O2 -g -c unhook.bpf.c -o unhook.bpf.o
+ *        (uses -target bpf builtins, no external headers needed)
  */
 
-#include "bpf_helpers.h"
+/* ── Minimal BPF types and macros (no external headers) ────────── */
+typedef unsigned char  __u8;
+typedef unsigned int   __u32;
+typedef unsigned long long __u64;
 
-char _license[] SEC("license") = "GPL";
+#define SEC(name) __attribute__((section(name), used))
+#define __always_inline inline __attribute__((always_inline))
 
-/* Map: user-space sets target addresses + counts */
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 4);
-    __type(key, __u32);
-    __type(value, unsigned long);
-} config SEC(".maps");
+/* BPF helper function IDs */
+#define BPF_FUNC_map_lookup_elem   1
+#define BPF_FUNC_probe_write_kernel 36
 
-/* bpf_probe_write_kernel helper */
+/* BPF map types (for ELF section) */
+enum bpf_map_type { BPF_MAP_TYPE_ARRAY = 2 };
+
+/* ── BPF builtin helper declarations ───────────────────────────── */
+
+/* bpf_map_lookup_elem: returns pointer to value or NULL */
+static void *(*bpf_map_lookup_elem)(void *map, const void *key)
+    = (void *)BPF_FUNC_map_lookup_elem;
+
+/* bpf_probe_write_kernel: write to kernel memory, returns 0 on success */
 static long (*probe_write_kernel)(void *dst, const void *src, __u32 len)
     = (void *)BPF_FUNC_probe_write_kernel;
+
+/* ── License ───────────────────────────────────────────────────── */
+char _license[] SEC("license") = "GPL";
+
+/* ── Configuration map ───────────────────────────────────────────
+ * key=0: pre_hook address,  key=1: pre_hook count
+ * key=2: post_hook address, key=3: post_hook count
+ */
+struct {
+    __u32 type;        /* BPF_MAP_TYPE_ARRAY */
+    __u32 max_entries; /* 4 */
+    __u32 key_size;    /* sizeof(__u32) */
+    __u32 value_size;  /* sizeof(__u64) */
+} config SEC(".maps") = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .max_entries = 4,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u64),
+};
+
+/* ── Kprobe handler ─────────────────────────────────────────────── */
 
 SEC("kprobe/__arm64_sys_getpid")
 int unhook_kprobe(struct pt_regs *ctx)
 {
-    unsigned long zero = 0;
+    __u64 zero = 0;
     __u32 key;
-    unsigned long *pre_addr, *pre_cnt;
-    unsigned long *post_addr, *post_cnt;
-    unsigned long i;
-    unsigned long count;
-    long ret;
+    __u64 *addr_ptr, *cnt_ptr;
+    __u64 target_addr, count, i;
 
-    /* Read pre_hook config: key=0 → addr, key=1 → count */
+    /* Read pre_hook config */
     key = 0;
-    pre_addr = bpf_map_lookup_elem(&config, &key);
+    addr_ptr = (__u64 *)bpf_map_lookup_elem(&config, &key);
     key = 1;
-    pre_cnt  = bpf_map_lookup_elem(&config, &key);
+    cnt_ptr  = (__u64 *)bpf_map_lookup_elem(&config, &key);
 
-    /* Read post_hook config: key=2 → addr, key=3 → count */
-    key = 2;
-    post_addr = bpf_map_lookup_elem(&config, &key);
-    key = 3;
-    post_cnt  = bpf_map_lookup_elem(&config, &key);
-
-    /* Zero pre_hook_array */
-    if (pre_addr && pre_cnt && *pre_addr) {
-        count = *pre_cnt > 64 ? 64 : *pre_cnt;
+    if (addr_ptr && cnt_ptr && *addr_ptr) {
+        target_addr = *addr_ptr;
+        count = *cnt_ptr;
+        if (count > 64) count = 64;
+        /* Zero function pointers: each hook entry = 16 bytes */
         for (i = 0; i < count; i++) {
-            ret = probe_write_kernel((void *)(*pre_addr + i * 16), &zero, 8);
-            if (ret != 0) break;
+            if (probe_write_kernel((void *)(target_addr + i * 16),
+                                   &zero, sizeof(zero)) != 0)
+                break;
         }
     }
 
-    /* Zero post_hook_array */
-    if (post_addr && post_cnt && *post_addr) {
-        count = *post_cnt > 64 ? 64 : *post_cnt;
+    /* Read post_hook config */
+    key = 2;
+    addr_ptr = (__u64 *)bpf_map_lookup_elem(&config, &key);
+    key = 3;
+    cnt_ptr  = (__u64 *)bpf_map_lookup_elem(&config, &key);
+
+    if (addr_ptr && cnt_ptr && *addr_ptr) {
+        target_addr = *addr_ptr;
+        count = *cnt_ptr;
+        if (count > 64) count = 64;
         for (i = 0; i < count; i++) {
-            ret = probe_write_kernel((void *)(*post_addr + i * 16), &zero, 8);
-            if (ret != 0) break;
+            if (probe_write_kernel((void *)(target_addr + i * 16),
+                                   &zero, sizeof(zero)) != 0)
+                break;
         }
     }
 
